@@ -1,0 +1,6 @@
+SuperVidel 3 Filesystem
+=======================
+
+This filesystem XFS is run by Mint on an Atari Falcon 030 with CT60/CT63/CT60e equiped with a SuperVidel 3. Older SuperVidels are not valid.
+The SV3FS communicates with a process in the Petalinux OS that is run on the built-in ARM Cortex A9 CPUs.
+Configuration done in Linux presents a path to where SV3FS can access the Linux filesystem.

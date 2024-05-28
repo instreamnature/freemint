@@ -1,0 +1,7 @@
+# This file gets included by the Makefile in this directory to determine
+# the files that should go only into source distributions.
+
+HEADER = sv3fs.h
+COBJS = sv3fs.c
+
+SRCFILES = $(HEADER) $(COBJS)

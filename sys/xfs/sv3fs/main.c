@@ -1,5 +1,5 @@
 /*
- * The SV3 filesystem access driver - entry point definitions.
+ * The Host OS filesystem access driver - driver main.
  *
  * This file belongs to FreeMiNT. It's not in the original MiNT 1.12
  * distribution. See the file CHANGES for a detailed log of changes.
@@ -25,14 +25,59 @@
  * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
-#ifndef _sv3fs_h_
-#define _sv3fs_h_
+#include "global.h"
+#include "sv3fs_xfs.h"
+#include "sv3fs_dev.h"
+#include "sv3fs.h"
 
-# include "mint/mint.h"
-# include "mint/file.h"
 
-extern FILESYS *sv3fs_mount_drives(FILESYS *fs);
+/*
+ * global kerinfo structure
+ */
+struct kerinfo *KERNEL;
 
-#endif /* _sv3fs_h_ */
+/*
+ * nf_ops->call function reference.
+ */
+long __CDECL (*nf_call)(long id, ...) = 0L;
 
+
+FILESYS * _cdecl init_xfs(struct kerinfo *k)
+{
+	FILESYS *fs = NULL;
+
+	KERNEL = k;
+
+	c_conws (MSG_BOOT);
+	c_conws (MSG_GREET);
+
+#ifdef ALPHA
+	c_conws (MSG_ALPHA);
+#elif defined (BETA)
+	c_conws (MSG_BETA);
+#endif
+
+	DEBUG(("Found MiNT %ld.%ld with kerinfo version %ld",
+		   (long)MINT_MAJOR, (long)MINT_MINOR, (long)MINT_KVERSION));
+
+	/* check for MiNT version */
+	if ( MINT_MAJOR < 1 || (MINT_MAJOR == 1 && MINT_MINOR < 16))
+	{
+		c_conws (MSG_OLDMINT);
+		c_conws (MSG_FAILURE("This filesystem requires MiNT 1.16.x"));
+
+		return NULL;
+	}
+
+	/* install filesystem */
+	fs = sv3fs_init();
+	if ( fs ) {
+		/* mount the drives according to
+		 * the [HOSTFS] sv3fsnfig section.
+		 */
+		fs = sv3fs_mount_drives( fs );
+	}
+
+	return fs;
+}
 

@@ -1,5 +1,5 @@
 #
-# Makefile for SV3FS
+# the m68k arch specific files
 #
 TARGET = sv3fs.xfs
 
@@ -8,31 +8,33 @@ SUBDIRS =
 
 srcdir = .
 top_srcdir = ../..
-subdir = 
+subdir = sv3fs
 
 default: all
-
-CPU = 060
 
 include $(top_srcdir)/CONFIGVARS
 include $(top_srcdir)/RULES
 include $(top_srcdir)/PHONY
 
-all-here: $(TARGET)
+all-here: build
+
+strip:
+	$(STRIP) $(TARGET)
+
+ifneq ($(kernel),)
+
+build: $(compile_dir)
+	cd $(compile_dir); $(MAKE) all
+
+else
+
+build:
+	$(MAKE) -f Makefile.xfs all
+
+endif
 
 # default overwrites
-INCLUDES = -I$(top_srcdir)
-DEFINITIONS = -D__KERNEL_XFS__
-
-LD = $(CC) -nostdlib -Wl,--entry,init_xfs -Wl,--fatal-warnings
-LIBS = $(LIBKERN) -lgcc
 
 # default definitions
-GENFILES = $(TARGET)
-OBJS = $(COBJS:.c=.o)
-
-$(TARGET): $(OBJS) $(LIBKERNTARGET)
-	$(LD) $(CFLAGS) -o $@ $(OBJS) $(LIBS)
-
-
-include $(top_srcdir)/DEPENDENCIES
+GENFILES = $(compile_all_dirs)
+GENFILES += $(TARGET)

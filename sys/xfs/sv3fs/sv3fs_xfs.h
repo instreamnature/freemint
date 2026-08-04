@@ -1,5 +1,5 @@
 /*
- * The SV3 filesystem access driver - entry point definitions.
+ * The Host OS filesystem access driver - filesystem definitions.
  *
  * This file belongs to FreeMiNT. It's not in the original MiNT 1.12
  * distribution. See the file CHANGES for a detailed log of changes.
@@ -25,14 +25,18 @@
  * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
-#ifndef _sv3fs_h_
-#define _sv3fs_h_
+#ifndef _sv3fs_xfs_h_
+#define _sv3fs_xfs_h_
 
 # include "mint/mint.h"
 # include "mint/file.h"
 
-extern FILESYS *sv3fs_mount_drives(FILESYS *fs);
+extern ulong    fs_drive_bits(void);
+extern long     fs_native_init(int fs_devnum, char *mountpoint, char *hostroot,
+				int halfsensitive, void *fs, void *fs_dev);
 
-#endif /* _sv3fs_h_ */
+extern FILESYS sv3fs_filesys;
+extern FILESYS *sv3fs_init(void);
 
+#endif /* _sv3fs_xfs_h_ */
 

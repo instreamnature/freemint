@@ -1,8 +1,8 @@
 #ifndef __SV_REGS_H__
 #define __SV_REGS_H__
 
-/*Last edit by TG on 2012-02-15*/
-/* added Superblitter interrupt register bits */
+/* Last edit by TG on 2022-xx-xx */
+/* added SV3 mailbox registers and PS DMA RAM area info */
 
 #ifdef _mint_ktypes_h
 	typedef u_int32_t		uint32_t;

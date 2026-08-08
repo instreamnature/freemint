@@ -1,0 +1,17 @@
+# This file gets included by the Makefile in this directory to determine
+# the files that should go only into source distributions.
+
+HEADER = \
+	sv_regs.h
+
+SV3ETH_SRCS = \
+	sv3eth.c
+
+COMMON_SRCS = \
+	../main.c
+
+COBJS = \
+	$(COMMON_SRCS) \
+	$(SV3ETH_SRCS)
+
+SRCFILES = $(HEADER) $(COBJS)

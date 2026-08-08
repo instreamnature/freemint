@@ -5,7 +5,7 @@ DRIVERS = rtl8012 rtl8012st dial slip plip dummy de600 lance pamsdma biodma \
 	rieblspc rieblspc_fast rieblmst rieblmst_fast rieblste riebltt asix rtl8139 picowifi
 
 SHELL = /bin/sh
-SUBDIRS = nfeth daynaport ethernat fec svethlana v2expeth v4net
+SUBDIRS = nfeth daynaport ethernat fec svethlana v2expeth v4net sv3eth
 
 srcdir = .
 top_srcdir = ../..

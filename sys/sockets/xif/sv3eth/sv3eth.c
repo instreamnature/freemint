@@ -35,7 +35,7 @@
  *		ifconfig en0 addr u.v.w.x
  *		route add u.v.w.x en0
  *
- *		20230905	/Henrik and Torbj�rn Gild�
+ *		20230905	/Torbjörn and Henrik Gildå
  *
  */
 
@@ -760,7 +760,8 @@ long driver_init (void)
 		ferror = Fread(fhandle,12,macbuf);
 		if(ferror < 0)
 		{
-			c_conws ("Error reading sv3eth.inf!\n\r");
+			ksprintf (message, "Error reading sv3eth.inf\n\r");
+			c_conws (message);
 			Fclose(fhandle);
 			return -1;
 		}
@@ -773,13 +774,14 @@ long driver_init (void)
 		Fclose(fhandle);
 
 		//print what we read from sv3eth.inf
+		c_conws("SV3ETH MAC is ");
 		c_conws(macbuf);
 		c_conws("\r\n");
 	}
 	else
 	{
 		c_conws("Could not open sv3eth.inf\n\r");
-		c_conws("Using default ethernet address 01:02:03:04:05:07\n\r");
+		c_conws("Using default MAC address 01:02:03:04:05:07\n\r");
 		macbuf[0] = '0';
 		macbuf[1] = '1';
 		macbuf[2] = '0';
@@ -794,7 +796,7 @@ long driver_init (void)
 		macbuf[11] = '7';
 	}
 
-	//Bconin(2);
+	Bconin(2);
 
 	macbuf[12] = 0;
 
@@ -1174,6 +1176,8 @@ void __attribute__ ((interrupt)) SV3_mbox0_isr(void)
 	//Dummy read from motherboard to satisfy ABE-chip
 	isr_temp = *((volatile uint16*)0xffff8240);
 
+	//c_conws( "Sv3eth ISR\r\n" );
+
 	sv3eth_service( &if_sv3eth, stat_reg );	//do the work
 
 	//Enable mailbox interrupt again
@@ -1252,7 +1256,7 @@ static void sv3eth_service (struct netif * nif, uint32 int_src)
 //	uchar	failpnr;
 //	ushort	fifo_reg;
 //	ushort	status, bytecount, longcnt;
-	short	type, i;
+	short	type;
 //	char	packetnr;
 //	char	message[80];
 //	long	tmp, *dpnt;
@@ -1265,7 +1269,7 @@ static void sv3eth_service (struct netif * nif, uint32 int_src)
 	// Check for received packet infos in the mailbox length fifo
 	if ( (mbox0.stat_ctrl & MBOX_STAT_RX_LFIFO_EMPTY) == 0 )
 	{
-		//printf("RX frame!\r\n");
+		//c_conws( "RX frame!\r\n" );
 
 		int32_t slot_len = Check_Rx_Buffers();
 		while (slot_len != -1)
@@ -1274,7 +1278,7 @@ static void sv3eth_service (struct netif * nif, uint32 int_src)
 			//volatile uint32_t	*origsrc;
 			uint32_t	*dest;
 			uint32_t	length;
-			uint32_t len_longs;
+			//uint32_t	len_longs;
 			uint32_t	slot;
 
 			//ksprintf (message, "R%02li 0x%08lx\n\r", slot, eth_rx_bd[slot].len_ctrl);
@@ -1282,26 +1286,59 @@ static void sv3eth_service (struct netif * nif, uint32 int_src)
 
 			slot      = slot_len >> 16;		//slot nr in upper word
 			length    = slot_len & 0xFFFF;	//length in lower word
-			len_longs = (length + 3UL) >> 2;	//round up to whole longwords
+			//len_longs = (length + 3UL) >> 2;	//round up to whole longwords
 
 			src = (volatile uint32_t*)ps_dma_bufs->rxbuffers[slot].buf;
 			//origsrc = src;
+
+			//Allocate packet buffer from mintnet buffers
+			//buf = buf_alloc (space, reserve, mode);
+ 			//where `space' is the size of the userspace of the BUF you need, `reserve'
+ 			//is used to set BUF.dstart = BUF.dend = BUF.data + `reserve' and
+			//mode is one of
+ 			//		BUF_NORMAL for calls from kernel space,
+ 			//		BUF_ATOMIC for calls from interrupt handlers.			
 
 //			b = buf_alloc (length+200, 100, BUF_ATOMIC);
 			b = buf_alloc (1518UL + 128UL, 64UL, BUF_ATOMIC);
 			if ( ((uint32_t)b) == 0UL )
 			{
+				// Allocation failed
 				nif->in_errors++;
-				//ksprintf (message, "buf_alloc RX failed, %lu \n\r", 1518UL + 128UL);
-				//c_conws(message);
+				ksprintf (message, "buf_alloc RX failed, %lu \n\r", 1518UL + 128UL);
+				c_conws(message);
 			}
 			else
 			{
+
+				//OLD:
 				//dstart must be on whole word, but we set to whole longword.
 				//should make the 060 use longword accesses and not risk that
 				//it is split into byte-word-byte.
+				//NEW: 
+				//We want the ip packet to start at even longword. So ethernet
+				//header must start 14 bytes before that.
+				//The allocation we did above using buf_alloc has
+				//dstart=dend=BUF.data[64]
+
+				//ksprintf (message, "buf.dstart=0x%08lx, dend=0x%08lx \n\r", (uint32)b->dstart, (uint32)b->dend );
+				//ksprintf (message, "Allocation:   buf.dstart=%p, dend=%p \n\r", (void*)b->dstart, (void*)b->dend );
+				//c_conws(message);
+
+				//First round down to even longword
 				b->dstart = (char*)(((uint32)(b->dstart)) & 0xFFFFFFFCUL);
 				b->dend   = (char*)(((uint32)(b->dend))   & 0xFFFFFFFCUL);
+
+				//ksprintf (message, "After round to 4:   buf.dstart=%p, dend=%p \n\r", (void*)b->dstart, (void*)b->dend );
+				//c_conws(message);
+
+				//Then remove 14 bytes for the ethernet ehader, so the IP header will
+				//start at even longword after copying of our data
+				b->dstart -= 14;
+				b->dend   -= 14;
+
+				//ksprintf (message, "After sub 14: buf.dstart=%p, dend=%p \n\r", (void*)b->dstart, (void*)b->dend );
+				//c_conws(message);
 
 				/*
 				//Dummy loop to wait for the MAC write FIFO to empty
@@ -1311,12 +1348,52 @@ static void sv3eth_service (struct netif * nif, uint32 int_src)
 				}
 				*/
 
-				//read the data, rounded up to even longwords
-				dest = (uint32*)(b->dstart);
-				for ( i=0; i < len_longs; i++ )
+				//Copy the ethernet frame from src to dest using longword moves
+				//But the src is even 4 bytes and the dest is even 2 bytes and not even 4 bytes
+				//So to get any performance in the memory operations we need to read longwords
+				//from src and shift the data 16 bits in a local variable before writing to dest.
 				{
-					*dest++ = *src++;
+					int i;
+					uint32_t current_lword;
+					uint32_t save_from_previous = 0;
+					int longwords_to_write = (length + 2 + 3) >> 2; // Totalt antal 32-bitars skrivningar
+					
+					// Förutsättning: b->dstart har redan ökats med 2.
+					// Vi skapar en 32-bitars justerad pekare som pekar 2 bytes *innan* dstart,
+					// vilket gör att när vi skriver till dst[0], skriver vi egentligen till de 2 pad-bytesen
+					// och de första 2 bytesen av din Ethernet-header.
+					dest = (uint32_t*)((char *)b->dstart - 2);
+
+					for ( i = 0; i < longwords_to_write; i++)
+					{
+						// 1. Läs 32 bitar från FPGA:n [A, B, C, D]
+						current_lword = *src++;
+						
+						// 2. Kombinera det sparade från förra varvet (till vänster) 
+						//    med det nya ordet skiftat 16 bitar till höger [0, 0, A, B]
+						*dest++ = save_from_previous | (current_lword >> 16);
+						
+						// 3. Spara de utskiftade 16 bitarna [C, D] till nästa varv 
+						//    genom att skifta dem 16 bitar till vänster -> [C, D, 0, 0]
+						save_from_previous = current_lword << 16;
+					}
+
+					// Om det finns restdata kvar i save_from_previous efter loopen (vid udda längder),
+					// skriver vi ut det sista blocket.
+					if ((length + 2) & 3)
+					{
+						*dest = save_from_previous;
+					}
 				}
+
+
+				//OLD:
+				//read the data, rounded up to even longwords
+				//dest = (uint32*)(b->dstart);
+				//for ( i=0; i < len_longs-2; i++ )
+				//{
+				//	*dest++ = *src++;
+				//}
 				
 //				b->dend += length - 4;							//TODO: should we subtract 4 here, to skip the CRC?
 //				b->dend += (uint32)(length - 4UL);				//TODO: should we subtract 4 here, to skip the CRC?
@@ -1346,14 +1423,17 @@ static void sv3eth_service (struct netif * nif, uint32 int_src)
 					bpf_input (nif, b);
 	
 				type = eth_remove_hdr(b);
-	
+
+				//ksprintf (message, "RX Ether type: 0x%04x, length %lu, dstart %p, dend-dstart %lu \n\r", type, length, b->dstart, (uint32_t)(b->dend - b->dstart));
+				//c_conws  (message);
+
 				// and enqueue packet
 				if(!if_input(nif, b, 0UL, type))
 					nif->in_packets++;
 				else
 				{
 					nif->in_errors++;
-					//c_conws("input packet failed when receiving!\n\r");
+					c_conws("Input packet failed when receiving!\n\r");
 				}
 			}
 				

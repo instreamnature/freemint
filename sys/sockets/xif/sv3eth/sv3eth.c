@@ -57,6 +57,11 @@
 
 
 
+// Max Ethernet frame size we accept, header+payload, no CRC.
+// 1514 = standard (14 header + 1500 payload)
+// 1518 = with support for 802.1Q VLAN-tag (14+4 header + 1500 payload)
+#define SV3ETH_MAX_RX_LEN   1518UL
+
 /*
  * From main.c
  */
@@ -309,7 +314,7 @@ sv3eth_close (struct netif *nif)
 static long
 sv3eth_output (struct netif *nif, BUF *buf, const char *hwaddr, short hwlen, short pktype)
 {
-	BUF			*nbuf;
+	BUF				*nbuf;
 	int32			result;
 //	unsigned char	littlemem;
 //	static	uchar	message[100];
@@ -317,7 +322,7 @@ sv3eth_output (struct netif *nif, BUF *buf, const char *hwaddr, short hwlen, sho
 //	unsigned long	timeval;
 
 
-	//c_conws("Output\n\r");		//debug
+	//c_conws("SV3ETH_output\n\r");		//debug
 
 	//*ETH_REG = (*ETH_REG) | 0x80;	//enable LED2
 
@@ -336,7 +341,7 @@ sv3eth_output (struct netif *nif, BUF *buf, const char *hwaddr, short hwlen, sho
 	nbuf = eth_build_hdr (buf, nif, hwaddr, pktype);
 	if ( ((uint32)nbuf) == 0UL)
 	{
-		//c_conws("eth_build_hdr() failed!\n\r");
+		c_conws("SV3ETH eth_build_hdr() failed!\n\r");
 		nif->out_errors++;
 		//*ETH_REG = (*ETH_REG) & 0x7F;	//disable LED2
 		return ENOMEM;
@@ -350,7 +355,7 @@ sv3eth_output (struct netif *nif, BUF *buf, const char *hwaddr, short hwlen, sho
 	 *
 	 * If you are done sending the packet free it with buf_deref().
 	 *
-	 * Before sending it pass it to the packet filter.
+	 * Before sending it pass it to the Berkley packet filter, for tcpdump tasks.
 	 */
 	if (nif->bpf)
 		bpf_input (nif, nbuf);
@@ -381,7 +386,7 @@ sv3eth_output (struct netif *nif, BUF *buf, const char *hwaddr, short hwlen, sho
 	else if(result == -2L)
 	{
 //		//packet too large, just throw away
-//		buf_deref(nbuf, BUF_NORMAL);
+		//The packet has already been derefed by send_packet()
 
 		//Turn on TX interrupt sources again
 //		ETH_INT_MASK = ETH_INT_MASK_RXF | ETH_INT_MASK_RXE | ETH_INT_MASK_TXE | ETH_INT_MASK_TXB;
@@ -431,6 +436,7 @@ static long send_packet	(struct netif *nif, BUF *nbuf, long buf_alloc_type, uint
 	uint32_t			 origlen;
 //	uchar	message[80];
 
+	//c_conws( "SV3ETH send_packet!\r\n" );
 	
 	//calculate packet length
 	origlen = (nbuf->dend) - (nbuf->dstart);
@@ -450,7 +456,7 @@ static long send_packet	(struct netif *nif, BUF *nbuf, long buf_alloc_type, uint
 	{
 		//Len FIFO is full, so don't try to send packet
 		//Do not buf_deref (nbuf, buf_alloc_type), since it is done outside this function
-		ksprintf( message, "Send_packet: Line 452: Len FIFO full, pkt info word not sent\r\n" );
+		ksprintf( message, "SV3ETH Send_packet: Line 452: Len FIFO full, pkt info word not sent\r\n" );
 		c_conws( message );
 		return -1;
 	}
@@ -506,7 +512,7 @@ static long send_packet	(struct netif *nif, BUF *nbuf, long buf_alloc_type, uint
 	c_conws (message);
 	*/
 	
-	//Dummy loop to wait for the CT60 write FIFO to empty
+	//Dummy loop to wait for the Supervidel CT60-write-FIFO to empty
 	for (j = 0; j < 1000; j++)
 	{
 		asm("nop;");
@@ -523,7 +529,7 @@ static long send_packet	(struct netif *nif, BUF *nbuf, long buf_alloc_type, uint
 	else
 	{
 		//Len FIFO is full, discard packet
-		ksprintf( message, "Send_packet: Len FIFO full, pkt info word not sent\r\n" );
+		ksprintf( message, "SV3ETH Send_packet: Len FIFO full, pkt info word not sent\r\n" );
 		c_conws( message );
 		//Do not buf_deref (nbuf, buf_alloc_type), since it is done outside this function
 		return -1;
@@ -752,7 +758,7 @@ long driver_init (void)
 	}
 
 	// Open sv3eth.inf to read the MAC address
-	ferror = Fopen( "sv3eth.inf",0 );
+	ferror = Fopen( "C:\\sv3eth.inf",0 );
 	if ( ferror >= 0 )
 	{
 		fhandle = (short)(ferror & 0xffff);
@@ -760,14 +766,14 @@ long driver_init (void)
 		ferror = Fread(fhandle,12,macbuf);
 		if(ferror < 0)
 		{
-			ksprintf (message, "Error reading sv3eth.inf\n\r");
+			ksprintf (message, "Error reading C:\\sv3eth.inf\n\r");
 			c_conws (message);
 			Fclose(fhandle);
 			return -1;
 		}
 		if(ferror < 12)
 		{
-			c_conws ("sv3eth.inf is less than 12 bytes long!\n\r");
+			c_conws ("C:\\sv3eth.inf is less than 12 bytes long!\n\r");
 			Fclose(fhandle);
 			return -1;
 		}
@@ -780,10 +786,10 @@ long driver_init (void)
 	}
 	else
 	{
-		c_conws("Could not open sv3eth.inf\n\r");
-		c_conws("Using default MAC address 01:02:03:04:05:07\n\r");
+		c_conws("Could not open C:\\sv3eth.inf\n\r");
+		c_conws("Using default MAC address 00:02:03:04:05:06\n\r");
 		macbuf[0] = '0';
-		macbuf[1] = '1';
+		macbuf[1] = '0';
 		macbuf[2] = '0';
 		macbuf[3] = '2';
 		macbuf[4] = '0';
@@ -793,10 +799,10 @@ long driver_init (void)
 		macbuf[8] = '0';
 		macbuf[9] = '5';
 		macbuf[10] = '0';
-		macbuf[11] = '7';
+		macbuf[11] = '6';
 	}
 
-	Bconin(2);
+	//Bconin(2);
 
 	macbuf[12] = 0;
 
@@ -1211,7 +1217,7 @@ int32 Check_Rx_Buffers()
 			//TX flag for the given slot
 			tx_dma_pkt_flags[pos] = 0;
 		}
-		else if ( len > 2048 )
+		else if ( len > SV3ETH_MAX_RX_LEN )		//1518 bytes
 		{
 			ksprintf( message, "Too much data %u bytes in rx packet\r\n", len );
 			c_conws( message );
@@ -1274,10 +1280,11 @@ static void sv3eth_service (struct netif * nif, uint32 int_src)
 		int32_t slot_len = Check_Rx_Buffers();
 		while (slot_len != -1)
 		{
-			volatile uint32_t	*src;
+			volatile uint8_t	*src;
 			//volatile uint32_t	*origsrc;
-			uint32_t	*dest;
+			//uint32_t	*dest;
 			uint32_t	length;
+			uint32_t	alloc_size;
 			//uint32_t	len_longs;
 			uint32_t	slot;
 
@@ -1288,8 +1295,38 @@ static void sv3eth_service (struct netif * nif, uint32 int_src)
 			length    = slot_len & 0xFFFF;	//length in lower word
 			//len_longs = (length + 3UL) >> 2;	//round up to whole longwords
 
-			src = (volatile uint32_t*)ps_dma_bufs->rxbuffers[slot].buf;
+			src = (volatile uint8_t*)ps_dma_bufs->rxbuffers[slot].buf;
 			//origsrc = src;
+
+			// Filter all packets that are not IPv4 or ARP.
+			// The type field is located at offset 12 in the ethernet header
+			// Also filter all packets with us as src
+			{
+				uint8_t *eth_head = (uint8_t*)src;
+				uint16_t raw_type = ((uint16_t)eth_head[12] << 8) | eth_head[13];
+				uint16_t src_mac[3];
+
+				// Filter out IPV6, UNKNOWN packets immediately
+				// If it's not IPv4 (0x0800) or ARP (0x0806), drop it before BPF_input or eth_remove_hdr
+				if (raw_type != 0x0800 && raw_type != 0x0806)
+				{
+					goto ACK_PACKET;
+				}
+
+				//Filter looped packets with our own MAC as src
+				src_mac[0] = ((uint16_t*)src)[3];
+				src_mac[1] = ((uint16_t*)src)[4];
+				src_mac[2] = ((uint16_t*)src)[5];
+
+				if ( (src_mac[0] == (uint16_t)(mac_addr[0] >> 16)) &&
+					 (src_mac[1] == (uint16_t)(mac_addr[0] & 0xFFFF)) &&
+					 (src_mac[2] == (uint16_t)(mac_addr[1] >> 16)) )
+				{
+					//ksprintf( message, "Sv3eth: removed looped packet, src mac %04x %04x %04x\r\n", src_mac[0], src_mac[1], src_mac[2] );
+					//c_conws(message);
+					goto ACK_PACKET;
+				}
+			}			
 
 			//Allocate packet buffer from mintnet buffers
 			//buf = buf_alloc (space, reserve, mode);
@@ -1299,18 +1336,70 @@ static void sv3eth_service (struct netif * nif, uint32 int_src)
  			//		BUF_NORMAL for calls from kernel space,
  			//		BUF_ATOMIC for calls from interrupt handlers.			
 
-//			b = buf_alloc (length+200, 100, BUF_ATOMIC);
-			b = buf_alloc (1518UL + 128UL, 64UL, BUF_ATOMIC);
+			//Allocate size with 128 bytes margin, and round length up to whole 4 bytes before
+			alloc_size = ((length + 3UL) & ~3UL) + 128UL;
+			b = buf_alloc ( alloc_size, 64UL, BUF_ATOMIC );
+
 			if ( ((uint32_t)b) == 0UL )
 			{
 				// Allocation failed
 				nif->in_errors++;
-				ksprintf (message, "buf_alloc RX failed, %lu \n\r", 1518UL + 128UL);
-				c_conws(message);
+				//ksprintf (message, "buf_alloc RX failed, %lu \n\r", 1518UL + 128UL);
+				//c_conws(message);
 			}
 			else
 			{
+				// 1. Set dstart to point where the Ethernet header should begin
+				b->dstart -= 14;
+				
+				// 2. Set dend to exactly dstart + length so the size is 100% correct
+				b->dend = b->dstart + length;
 
+				// 3. STRAIGHT LONGWORD COPY
+				// Copy 32 bits at a time to eliminate alignment bugs while keeping decent speed.
+				{
+					uint32_t *src_lwords  = (uint32_t*)ps_dma_bufs->rxbuffers[slot].buf;
+					uint32_t *dest_lwords = (uint32_t*)b->dstart;
+					uint32_t lword_count  = (length + 3UL) >> 2; // Round up to nearest whole longword
+					uint32_t i;
+
+					for (i = 0; i < lword_count; i++)
+					{
+						*dest_lwords++ = *src_lwords++;
+					}
+				}
+
+				// 4. Pass packet to BPF if active
+				if (nif->bpf)
+					bpf_input (nif, b);
+	
+				//Print start of frame for debugging
+				//{
+				//	uint8_t *d = (uint8_t*)b->dstart;
+				//	ksprintf(message, "SV3ETH MAC %08lx%04x RX DATA: DST %02x %02x %02x %02x %02x %02x | SRC %02x %02x %02x %02x %02x %02x | TYPE: %02x %02x\r\n",
+				//			mac_addr[0],							//First 8 digits of our own MAC
+				//			(uint16_t)(mac_addr[1] >> 16),			//Last 4 digits of our own MAC
+				//			d[0], d[1], d[2], d[3], d[4], d[5],    // Destination MAC
+				//			d[6], d[7], d[8], d[9], d[10], d[11],  // Source MAC
+				//			d[12], d[13]); 
+				//	c_conws(message);
+				//}
+
+				// 5. Process hardware header
+				type = eth_remove_hdr(b);
+				
+				// 6. Enqueue and pass packet to MiNT-Net
+				if ( !if_input(nif, b, 0UL, type) )
+				{
+					nif->in_packets++;
+				}
+				else
+				{
+					nif->in_errors++;
+					//c_conws("Input packet failed when receiving!\n\r");
+				}
+
+				/*
 				//OLD:
 				//dstart must be on whole word, but we set to whole longword.
 				//should make the 060 use longword accesses and not risk that
@@ -1339,14 +1428,6 @@ static void sv3eth_service (struct netif * nif, uint32 int_src)
 
 				//ksprintf (message, "After sub 14: buf.dstart=%p, dend=%p \n\r", (void*)b->dstart, (void*)b->dend );
 				//c_conws(message);
-
-				/*
-				//Dummy loop to wait for the MAC write FIFO to empty
-				for (j = 0; j < 1000; j++)
-				{
-					asm("nop;");
-				}
-				*/
 
 				//Copy the ethernet frame from src to dest using longword moves
 				//But the src is even 4 bytes and the dest is even 2 bytes and not even 4 bytes
@@ -1402,8 +1483,8 @@ static void sv3eth_service (struct netif * nif, uint32 int_src)
 				{
 					//c_conws("SV3ETH RX: dend < dstart!\r\n");
 				}
-
-				/*
+				
+				#if 0
 				//Print packet start and end data
 				ksprintf (message, "RX slot %2lu, %4lu bytes: %08lx %08lx %08lx %08lx ... %08lx %08lx\r\n",
 								slot,
@@ -1416,7 +1497,7 @@ static void sv3eth_service (struct netif * nif, uint32 int_src)
 								origsrc[len_longs-1]
 							);
 				c_conws (message);
-				*/
+				#endif
 
 				// Pass packet to upper layers
 				if (nif->bpf)
@@ -1435,9 +1516,12 @@ static void sv3eth_service (struct netif * nif, uint32 int_src)
 					nif->in_errors++;
 					c_conws("Input packet failed when receiving!\n\r");
 				}
+				*/
 			}
 				
-			//Send ACK to the (linux side) sender that we have handled this packet
+			ACK_PACKET :
+
+			//Send ACK to the (petalinux side) sender that we have handled this packet
 			if ( (mbox0.stat_ctrl & MBOX_STAT_TX_LFIFO_FULL) == 0 )
 			{
 				//Len FIFO not full, send ACK msg

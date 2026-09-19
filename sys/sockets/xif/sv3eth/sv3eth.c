@@ -56,7 +56,6 @@
 #include <mint/osbind.h>
 
 
-
 // Max Ethernet frame size we accept, header+payload, no CRC.
 // 1514 = standard (14 header + 1500 payload)
 // 1518 = with support for 802.1Q VLAN-tag (14+4 header + 1500 payload)
@@ -84,6 +83,7 @@ static long	sv3eth_close	(struct netif *);
 static long	sv3eth_output	(struct netif *, BUF *, const char *, short, short);
 static long	sv3eth_ioctl	(struct netif *, short, long);
 static long	sv3eth_config	(struct netif *, struct ifopt *);
+static void sv3eth_timeout	(struct netif *);
 
 //does actual sending of packets for sv3eth_output() and sv3eth_service()
 static long send_packet			(struct netif *nif, BUF *nbuf, long buf_alloc_type, uint32 slot, uint32 last_packet);
@@ -143,6 +143,13 @@ static volatile uint32	has_printed_functions = 0UL;
 volatile PS_DMA_BUFFERS* ps_dma_bufs = (PS_DMA_BUFFERS*)PS_DMA_BASE;
 static volatile uint8_t	 tx_dma_pkt_flags[PS_DMA_BUFFER_PKTS];
 static volatile uint32_t tx_dma_pos;
+
+// Diagnostic counters, safe to increment from ISR context
+// Reported periodically from sv3eth_timeout(), which runs in normal
+// (non-interrupt) context.
+static volatile uint32_t bad_slot_count		= 0;   // slot/pos value from HW was >= PS_DMA_BUFFER_PKTS
+static volatile uint32_t oversized_rx_count	= 0;   // RX packet len > SV3ETH_MAX_RX_LEN
+static volatile uint32_t tx_fifo_full_count	= 0;   // Len FIFO was full when we tried to ACK
 
 
 /// Init internal flags array for the DMA buffers in SVRAM
@@ -666,40 +673,98 @@ sv3eth_config (struct netif *nif, struct ifopt *ifo)
 }
 
 
+
 /*
-void Init_BD()
+ * Called periodically (every nif->timer ms) by MintNet, in normal
+ * process context - safe to call c_conws/ksprintf here.
+ * Reports our diagnostic counters only when they've changed, so we
+ * don't spam the console during normal operation.
+ */
+static void
+sv3eth_timeout (struct netif *nif)
 {
-	uint32_t	i;
-	char*			even_packet_base;
-	
-	packets_base = (char*) ct60_vmalloc(ETH_PKT_BUFFS * 2UL * 2048UL + 2048UL);
-	even_packet_base = (char*)((((unsigned long)packets_base) + 2047UL) & 0xFFFFF800UL);	//Make it all start at even 2048 bytes
+	static uint32_t last_bad_slot    = 0;
+	static uint32_t last_oversized   = 0;
+	static uint32_t last_fifo_full   = 0;
 
-	//Set number of TX packet BDs and RX BDs
-	ETH_TX_BD_NUM = ETH_PKT_BUFFS;
+	uint32_t cur_bad_slot  = bad_slot_count;
+	uint32_t cur_oversized = oversized_rx_count;
+	uint32_t cur_fifo_full = tx_fifo_full_count;
 
-	//Init each BD ctrl longword
-	//Init all RX slots to empty, so they can receive a packet
-	//Init all data pointers, so they get 2048 bytes each.
-	for (i = 0; i < ETH_PKT_BUFFS; i++)
+	uint16_t time_bits = Tgettime();
+	uint16_t date_bits = Tgetdate();
+
+	// Decode time (DOSTIME)
+	int seconds = (time_bits & 0x1F) * 2; // Bit 0-4 (measured in 2-sec interval)
+	int minutes = (time_bits >> 5) & 0x3F; // Bit 5-10
+	int hours   = (time_bits >> 11) & 0x1F; // Bit 11-15
+
+	// Decode date (DOSDATE)
+	int day   = date_bits & 0x1F;          // Bit 0-4
+	int month = (date_bits >> 5) & 0x0F;   // Bit 5-8
+	int year  = ((date_bits >> 9) & 0x7F) + 1980; // Bit 9-15 (years since 1980)
+	#if (0)
 	{
-		if (i != (ETH_PKT_BUFFS-1))
-		{
-			eth_tx_bd[i].len_ctrl = ETH_TX_BD_CRC;																	// no wrap
-			eth_rx_bd[i].len_ctrl = ETH_RX_BD_EMPTY | ETH_RX_BD_IRQ;								// no wrap
-		}
-		else
-		{
-			eth_tx_bd[i].len_ctrl = ETH_TX_BD_CRC   | ETH_TX_BD_WRAP;									// wrap on last TX BD
-			eth_rx_bd[i].len_ctrl = ETH_RX_BD_EMPTY | ETH_RX_BD_IRQ | ETH_RX_BD_WRAP;	// wrap on last RX BD
-		}
-		eth_tx_bd[i].data_pnt = ((uint32_t)even_packet_base) + (i*2048UL);		//TX buffers come first
-		eth_rx_bd[i].data_pnt = ((uint32_t)even_packet_base) + ((ETH_PKT_BUFFS+i)*2048UL);		//then all RX buffers
-	}	
+		int16_t fh;
+		long    wr;
 
+		// Open in append-mode (mode 1 = read/write) if file exists,
+		// else create it. We open and close each time.
+		fh = (int16_t)Fopen("C:\\SV3LOG.TXT", 1);
+		if (fh < 0)
+			fh = (int16_t)Fcreate("C:\\SV3LOG.TXT", 0);
+
+		if (fh >= 0)
+		{
+			// Point to file end (append)
+			Fseek(0L, fh, 2);
+
+			ksprintf(message, "%02d/%02d/%02d %02d:%02d:%02d : %lu inpackets, %lu inerrors, "
+			                   "%lu bad_slot, %lu oversized, %lu fifo_full\r\n",
+			         year, month, day, hours, minutes, seconds,
+			         nif->in_packets, nif->in_errors,
+			         cur_bad_slot, cur_oversized, cur_fifo_full);
+
+			wr = Fwrite(fh, (long)strlen(message), message);
+			(void)wr;   // ev. felkontroll om du vill
+
+			Fclose(fh);
+		}
+	}
+	#endif
+
+	if ((cur_bad_slot  != last_bad_slot ) ||
+	    (cur_oversized != last_oversized) ||
+		(cur_fifo_full != last_fifo_full))
+	{
+		ksprintf(message, "sv3eth_timeout %02d/%02d/%02d %02d:%02d:%02d : ",
+					year, month, day, hours, minutes, seconds );
+		c_conws(message);
+	}
+
+	if (cur_bad_slot != last_bad_slot)
+	{
+		ksprintf(message, "%lu out-of-range slot values from HW mailbox\r\n",
+				 cur_bad_slot - last_bad_slot);
+		c_conws(message);
+		last_bad_slot = cur_bad_slot;
+	}
+
+	if (cur_oversized != last_oversized)
+	{
+		ksprintf(message, "%lu oversized RX packets dropped (> %lu bytes)\r\n",
+				 cur_oversized - last_oversized, (uint32_t)SV3ETH_MAX_RX_LEN);
+		c_conws(message);
+		last_oversized = cur_oversized;
+	}
+
+	if (cur_fifo_full != last_fifo_full)
+	{
+		ksprintf(message, "%lu Len FIFO full events\r\n", cur_fifo_full - last_fifo_full);
+		c_conws(message);
+		last_fifo_full = cur_fifo_full;
+	}
 }
-*/
-
 
 
 // ============================
@@ -729,7 +794,7 @@ long driver_init (void)
 //	char message[50];
 	//static char eth_fname[128];
 
-	long	ferror;
+	long	ferr;
 	short	fhandle;
 	char	macbuf[13];
 	uint32	rx_pkts = 0;
@@ -758,20 +823,20 @@ long driver_init (void)
 	}
 
 	// Open sv3eth.inf to read the MAC address
-	ferror = Fopen( "C:\\sv3eth.inf",0 );
-	if ( ferror >= 0 )
+	ferr = Fopen( "C:\\sv3eth.inf",0 );
+	if ( ferr >= 0 )
 	{
-		fhandle = (short)(ferror & 0xffff);
+		fhandle = (short)(ferr & 0xffff);
 		memset(macbuf, 0, 13);
-		ferror = Fread(fhandle,12,macbuf);
-		if(ferror < 0)
+		ferr = Fread(fhandle,12,macbuf);
+		if(ferr < 0)
 		{
 			ksprintf (message, "Error reading C:\\sv3eth.inf\n\r");
 			c_conws (message);
 			Fclose(fhandle);
 			return -1;
 		}
-		if(ferror < 12)
+		if(ferr < 12)
 		{
 			c_conws ("C:\\sv3eth.inf is less than 12 bytes long!\n\r");
 			Fclose(fhandle);
@@ -866,7 +931,7 @@ long driver_init (void)
 	/*
 	 * Time in ms between calls to (*if_sv3eth.timeout) ();
 	 */
-	if_sv3eth.timer = 0;
+	if_sv3eth.timer = 1000;
 	
 	/*
 	 * Interface hardware type
@@ -902,7 +967,7 @@ long driver_init (void)
 	/*
 	 * Optional timer function that is called every 200ms.
 	 */
-	if_sv3eth.timeout = NULL;
+	if_sv3eth.timeout = sv3eth_timeout;
 	
 	/*
 	 * Here you could attach some more data your driver may need
@@ -1083,8 +1148,15 @@ long driver_init (void)
 			//Top word is RX slot index to read packet from
 			uint32_t len_val = mbox0.len_fifo;
 			uint32_t len     = len_val & 0xFFFF;
-			uint32_t pos     = len_val >> 16;
-		
+			uint32_t raw_pos = len_val >> 16;
+			uint32_t pos     = 0;
+	
+			if ( raw_pos >= PS_DMA_BUFFER_PKTS )
+			{
+				bad_slot_count++;
+			}
+			pos = raw_pos & (PS_DMA_BUFFER_PKTS - 1);
+
 			if ( len == 0xFFFF )
 			{
 				//This is a special encoding that tells us to clear the
@@ -1100,7 +1172,8 @@ long driver_init (void)
 				//while ( mbox0.stat_ctrl & MBOX_STAT_TX_LFIFO_FULL );
 				//Len FIFO not full, send ACK msg
 				//mbox0.len_fifo = len_val | 0xFFFFUL;
-				write_len_fifo_ctrl(len_val | 0xFFFFUL);
+
+				write_len_fifo_ctrl( (pos << 16) | 0xFFFFUL );
 				rx_pkts++;
 				//c_conws("R");
 			}
@@ -1146,25 +1219,6 @@ static void sv3eth_install_int (void)
 /*
  * Interrupt routine
  */
-/*
-void _cdecl
-sv3eth_int (void)
-{
-	uint32	int_src;
-	volatile uint16 temp;
-
-	//Dummy read from motherboard to satisfy ABE-chip (should be done before interrupt
-	//source is quenched? Interrupt is effectively shut off above)
-	temp = *((volatile uint16*)0xffff8240);
-
-	int_src = ETH_INT_SOURCE;
-
-	//Clear all flags by writing 1 to them
-	ETH_INT_SOURCE = 0x7FUL;
-
-	sv3eth_service(&if_sv3eth, int_src);	//do the work
-}
-*/
 
 volatile uint32_t isr_flag = 0;
 volatile uint16_t isr_temp;
@@ -1180,7 +1234,7 @@ void __attribute__ ((interrupt)) SV3_mbox0_isr(void)
 	isr_flag = 1;
 
 	//Dummy read from motherboard to satisfy ABE-chip
-	isr_temp = *((volatile uint16*)0xffff8240);
+	//isr_temp = *((volatile uint16*)0xffff8240);
 
 	//c_conws( "Sv3eth ISR\r\n" );
 
@@ -1208,9 +1262,21 @@ int32 Check_Rx_Buffers()
 		//Top word is RX slot index to read packet from
 		uint32_t len_val = mbox0.len_fifo;
 		uint32_t len     = len_val & 0xFFFF;
-		uint32_t pos     = len_val >> 16;
+		uint32_t raw_pos = len_val >> 16;
+		uint32_t pos     = 0;
 		//printf( "Mailbox0 pos is %u, length is %u\r\n", pos, len );
 	
+		// Defensive masking: raw_pos comes straight from the hardware
+		// mailbox and is a full 16-bit value, but we only have
+		// PS_DMA_BUFFER_PKTS slots. Count it if it was ever out of range,
+		// then mask it so we never index tx_dma_pkt_flags[] or
+		// rxbuffers[] out of bounds.
+		if ( raw_pos >= PS_DMA_BUFFER_PKTS )
+		{
+			bad_slot_count++;
+		}
+		pos = raw_pos & (PS_DMA_BUFFER_PKTS - 1);
+
 		if ( len == 0xFFFF )
 		{
 			//This is a special encoding that tells us to clear the
@@ -1219,27 +1285,30 @@ int32 Check_Rx_Buffers()
 		}
 		else if ( len > SV3ETH_MAX_RX_LEN )		//1518 bytes
 		{
-			ksprintf( message, "Too much data %u bytes in rx packet\r\n", len );
-			c_conws( message );
+			//ksprintf( message, "Too much data %u bytes in rx packet\r\n", len );
+			//c_conws( message );
+			oversized_rx_count++;
 
 			//Send ACK to the sender that we have handled this packet
 			if ( (mbox0.stat_ctrl & MBOX_STAT_TX_LFIFO_FULL) == 0 )
 			{
 				//Len FIFO not full, send ACK msg
-				mbox0.len_fifo = len_val | 0xFFFFUL;
+				mbox0.len_fifo = (pos << 16) | 0xFFFFUL;
 			}
 			else
 			{
 				//Len FIFO is full
-				ksprintf( message, "Check_Rx_Buffers: Len FIFO full\r\n" );
-				c_conws( message );
+				tx_fifo_full_count++;
+				//ksprintf( message, "Check_Rx_Buffers: Len FIFO full\r\n" );
+				//c_conws( message );
 			}
 			continue;
 		}
 		else
 		{
-			//Found a valid RX packet
-			retval = (int32_t)len_val;
+			//Found a valid RX packet. Re-encode with the masked pos,
+			//so callers (sv3eth_service) never see an out-of-range slot.
+			retval = (int32_t)((pos << 16) | len);
 			break;
 		}
 

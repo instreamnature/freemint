@@ -46,6 +46,7 @@
 #include "inet4/ifeth.h"
 
 #include "netinfo.h"
+#include "mint/asm.h"
 #include "mint/delay.h"
 #include "mint/mdelay.h"
 #include "mint/sockio.h"
@@ -144,12 +145,23 @@ volatile PS_DMA_BUFFERS* ps_dma_bufs = (PS_DMA_BUFFERS*)PS_DMA_BASE;
 static volatile uint8_t	 tx_dma_pkt_flags[PS_DMA_BUFFER_PKTS];
 static volatile uint32_t tx_dma_pos;
 
-// Diagnostic counters, safe to increment from ISR context
-// Reported periodically from sv3eth_timeout(), which runs in normal
-// (non-interrupt) context.
+// Diagnostic counters, safe to increment from ISR context.
+// They are never printed from ISR, root timeout or packet processing
+// context, since c_conws() writes to fd 1 of whatever process happens
+// to be current and may sleep. They are printed on request with
+// "ifconfig en0 -f <file>", where <file> contains the line "stats 1".
+// That runs sv3eth_config() in the context of the ifconfig process.
 static volatile uint32_t bad_slot_count		= 0;   // slot/pos value from HW was >= PS_DMA_BUFFER_PKTS
 static volatile uint32_t oversized_rx_count	= 0;   // RX packet len > SV3ETH_MAX_RX_LEN
-static volatile uint32_t tx_fifo_full_count	= 0;   // Len FIFO was full when we tried to ACK
+static volatile uint32_t tx_fifo_full_count	= 0;   // Len FIFO was full when we tried to ACK an oversized RX packet
+static volatile uint32_t rx_ack_fifo_full_count	= 0;   // Len FIFO was full when we tried to ACK a normal RX packet
+static volatile uint32_t tx_build_hdr_fail_count	= 0;   // eth_build_hdr() failed in sv3eth_output()
+static volatile uint32_t tx_too_large_count	= 0;   // TX packet too large, dropped
+static volatile uint32_t tx_fifo_full_pre_count	= 0;   // send_packet(): Len FIFO full before packet copy
+static volatile uint32_t tx_no_free_slot_count	= 0;   // send_packet(): all TX slots busy
+static volatile uint32_t tx_fifo_full_post_count	= 0;   // send_packet(): Len FIFO full after packet copy
+static volatile uint32_t rx_buf_alloc_fail_count	= 0;   // buf_alloc() failed for an RX packet
+static volatile uint32_t rx_if_input_fail_count	= 0;   // if_input() failed, RX queue full
 
 
 /// Init internal flags array for the DMA buffers in SVRAM
@@ -323,6 +335,7 @@ sv3eth_output (struct netif *nif, BUF *buf, const char *hwaddr, short hwlen, sho
 {
 	BUF				*nbuf;
 	int32			result;
+	ushort			sr;
 //	unsigned char	littlemem;
 //	static	uchar	message[100];
 
@@ -348,7 +361,7 @@ sv3eth_output (struct netif *nif, BUF *buf, const char *hwaddr, short hwlen, sho
 	nbuf = eth_build_hdr (buf, nif, hwaddr, pktype);
 	if ( ((uint32)nbuf) == 0UL)
 	{
-		c_conws("SV3ETH eth_build_hdr() failed!\n\r");
+		tx_build_hdr_fail_count++;
 		nif->out_errors++;
 		//*ETH_REG = (*ETH_REG) & 0x7F;	//disable LED2
 		return ENOMEM;
@@ -368,22 +381,16 @@ sv3eth_output (struct netif *nif, BUF *buf, const char *hwaddr, short hwlen, sho
 		bpf_input (nif, nbuf);
 
 
-	//in_use = 1;											//don't let interrupt disturb us now
-
-	//disable RX interrupt sources
-	mbox0.stat_ctrl &= ~MBOX_STAT_RX_LFIFO_IE;
-
-	//shut out TX and RX interrupt, so we can send our packet safely
-	//	ETH_INT_MASK = 0UL;	
-	//Turn off interrupts completely
-	//int_off();	
+	//Mask interrupts in the CPU instead of disabling the interrupt source
+	//in the mailbox. Clearing MBOX_STAT_RX_LFIFO_IE while an IRQ6 may
+	//already be on its way to the CPU can leave an IACK cycle unanswered,
+	//which ends in a bus error. With spl7() a pending mailbox interrupt is
+	//simply taken when the old interrupt level is restored.
+	sr = spl7();
 
 	result = send_packet(nif, nbuf, BUF_NORMAL, tx_dma_pos, tx_dma_pos == (PS_DMA_BUFFER_PKTS-1) );
 
-	//in_use = 0;
-	//int_on();
-	//Enable RX interrupt sources
-	mbox0.stat_ctrl |= MBOX_STAT_RX_LFIFO_IE;
+	spl(sr);
 
 	if(result == 0L)
 	{
@@ -398,7 +405,8 @@ sv3eth_output (struct netif *nif, BUF *buf, const char *hwaddr, short hwlen, sho
 		//Turn on TX interrupt sources again
 //		ETH_INT_MASK = ETH_INT_MASK_RXF | ETH_INT_MASK_RXE | ETH_INT_MASK_TXE | ETH_INT_MASK_TXB;
 
-		c_conws("sv3eth_output: too large\r\n");
+		tx_too_large_count++;
+		nif->out_errors++;
 
 //		int_on();
 //		return EMSGSIZE;
@@ -410,7 +418,8 @@ sv3eth_output (struct netif *nif, BUF *buf, const char *hwaddr, short hwlen, sho
 		//if_enqueue (&nif->snd, nbuf, nbuf->info);
 //		in_queue++;
 
-		c_conws("sv3eth_output: no free buffer\r\n");
+		//The reason is counted in send_packet()
+		nif->out_errors++;
 
 		//just throw away
 		buf_deref(nbuf, BUF_NORMAL);
@@ -463,8 +472,7 @@ static long send_packet	(struct netif *nif, BUF *nbuf, long buf_alloc_type, uint
 	{
 		//Len FIFO is full, so don't try to send packet
 		//Do not buf_deref (nbuf, buf_alloc_type), since it is done outside this function
-		ksprintf( message, "SV3ETH Send_packet: Line 452: Len FIFO full, pkt info word not sent\r\n" );
-		c_conws( message );
+		tx_fifo_full_pre_count++;
 		return -1;
 	}
 
@@ -481,6 +489,7 @@ static long send_packet	(struct netif *nif, BUF *nbuf, long buf_alloc_type, uint
 		{
 			//Failed to find free slot
 			//Do not buf_deref (nbuf, buf_alloc_type), since it is done outside this function
+			tx_no_free_slot_count++;
 			return -1;
 		}
 		slot++;
@@ -536,8 +545,7 @@ static long send_packet	(struct netif *nif, BUF *nbuf, long buf_alloc_type, uint
 	else
 	{
 		//Len FIFO is full, discard packet
-		ksprintf( message, "SV3ETH Send_packet: Len FIFO full, pkt info word not sent\r\n" );
-		c_conws( message );
+		tx_fifo_full_post_count++;
 		//Do not buf_deref (nbuf, buf_alloc_type), since it is done outside this function
 		return -1;
 	}
@@ -668,103 +676,47 @@ sv3eth_config (struct netif *nif, struct ifopt *ifo)
 			return ENOENT;
 		DEBUG (("sv3eth: log file is %s", ifo->ifou.v_string));
 	}
-	
+	else if (!STRNCMP ("stats"))
+	{
+		/*
+		 * Print diagnostic counters. We are called from the ioctl of
+		 * the ifconfig process here, so c_conws() writes to its stdout.
+		 */
+		(void)nif;
+		ksprintf (message, "sv3eth stats: bad_slot %lu, oversized_rx %lu, "
+		          "rx_ack_fifo_full %lu, oversized_ack_fifo_full %lu\r\n",
+		          bad_slot_count, oversized_rx_count,
+		          rx_ack_fifo_full_count, tx_fifo_full_count);
+		c_conws (message);
+		ksprintf (message, "sv3eth stats: tx_build_hdr_fail %lu, tx_too_large %lu, "
+		          "tx_fifo_full_pre %lu, tx_no_free_slot %lu, tx_fifo_full_post %lu\r\n",
+		          tx_build_hdr_fail_count, tx_too_large_count,
+		          tx_fifo_full_pre_count, tx_no_free_slot_count,
+		          tx_fifo_full_post_count);
+		c_conws (message);
+		ksprintf (message, "sv3eth stats: rx_buf_alloc_fail %lu, rx_if_input_fail %lu\r\n",
+		          rx_buf_alloc_fail_count, rx_if_input_fail_count);
+		c_conws (message);
+		return 0;
+	}
+
 	return ENOSYS;
 }
 
 
 
-/*
- * Called periodically (every nif->timer ms) by MintNet, in normal
- * process context - safe to call c_conws/ksprintf here.
- * Reports our diagnostic counters only when they've changed, so we
- * don't spam the console during normal operation.
- */
+
+//This timeout function is called by the kernel after an addroottimeout call,
+//and is called from kernel context. So it is not ok to call GEMDOS functions
+//(c_conws() included) or other things that may stall.
+//The diagnostic counters are printed with the "stats" option instead,
+//see sv3eth_config().
 static void
 sv3eth_timeout (struct netif *nif)
 {
-	static uint32_t last_bad_slot    = 0;
-	static uint32_t last_oversized   = 0;
-	static uint32_t last_fifo_full   = 0;
-
-	uint32_t cur_bad_slot  = bad_slot_count;
-	uint32_t cur_oversized = oversized_rx_count;
-	uint32_t cur_fifo_full = tx_fifo_full_count;
-
-	uint16_t time_bits = Tgettime();
-	uint16_t date_bits = Tgetdate();
-
-	// Decode time (DOSTIME)
-	int seconds = (time_bits & 0x1F) * 2; // Bit 0-4 (measured in 2-sec interval)
-	int minutes = (time_bits >> 5) & 0x3F; // Bit 5-10
-	int hours   = (time_bits >> 11) & 0x1F; // Bit 11-15
-
-	// Decode date (DOSDATE)
-	int day   = date_bits & 0x1F;          // Bit 0-4
-	int month = (date_bits >> 5) & 0x0F;   // Bit 5-8
-	int year  = ((date_bits >> 9) & 0x7F) + 1980; // Bit 9-15 (years since 1980)
-	#if (0)
-	{
-		int16_t fh;
-		long    wr;
-
-		// Open in append-mode (mode 1 = read/write) if file exists,
-		// else create it. We open and close each time.
-		fh = (int16_t)Fopen("C:\\SV3LOG.TXT", 1);
-		if (fh < 0)
-			fh = (int16_t)Fcreate("C:\\SV3LOG.TXT", 0);
-
-		if (fh >= 0)
-		{
-			// Point to file end (append)
-			Fseek(0L, fh, 2);
-
-			ksprintf(message, "%02d/%02d/%02d %02d:%02d:%02d : %lu inpackets, %lu inerrors, "
-			                   "%lu bad_slot, %lu oversized, %lu fifo_full\r\n",
-			         year, month, day, hours, minutes, seconds,
-			         nif->in_packets, nif->in_errors,
-			         cur_bad_slot, cur_oversized, cur_fifo_full);
-
-			wr = Fwrite(fh, (long)strlen(message), message);
-			(void)wr;   // ev. felkontroll om du vill
-
-			Fclose(fh);
-		}
-	}
-	#endif
-
-	if ((cur_bad_slot  != last_bad_slot ) ||
-	    (cur_oversized != last_oversized) ||
-		(cur_fifo_full != last_fifo_full))
-	{
-		ksprintf(message, "sv3eth_timeout %02d/%02d/%02d %02d:%02d:%02d : ",
-					year, month, day, hours, minutes, seconds );
-		c_conws(message);
-	}
-
-	if (cur_bad_slot != last_bad_slot)
-	{
-		ksprintf(message, "%lu out-of-range slot values from HW mailbox\r\n",
-				 cur_bad_slot - last_bad_slot);
-		c_conws(message);
-		last_bad_slot = cur_bad_slot;
-	}
-
-	if (cur_oversized != last_oversized)
-	{
-		ksprintf(message, "%lu oversized RX packets dropped (> %lu bytes)\r\n",
-				 cur_oversized - last_oversized, (uint32_t)SV3ETH_MAX_RX_LEN);
-		c_conws(message);
-		last_oversized = cur_oversized;
-	}
-
-	if (cur_fifo_full != last_fifo_full)
-	{
-		ksprintf(message, "%lu Len FIFO full events\r\n", cur_fifo_full - last_fifo_full);
-		c_conws(message);
-		last_fifo_full = cur_fifo_full;
-	}
+	(void)nif;
 }
+
 
 
 // ============================
@@ -1412,6 +1364,7 @@ static void sv3eth_service (struct netif * nif, uint32 int_src)
 			if ( ((uint32_t)b) == 0UL )
 			{
 				// Allocation failed
+				rx_buf_alloc_fail_count++;
 				nif->in_errors++;
 				//ksprintf (message, "buf_alloc RX failed, %lu \n\r", 1518UL + 128UL);
 				//c_conws(message);
@@ -1464,6 +1417,7 @@ static void sv3eth_service (struct netif * nif, uint32 int_src)
 				}
 				else
 				{
+					rx_if_input_fail_count++;
 					nif->in_errors++;
 					//c_conws("Input packet failed when receiving!\n\r");
 				}
@@ -1599,6 +1553,7 @@ static void sv3eth_service (struct netif * nif, uint32 int_src)
 			else
 			{
 				//Len FIFO is full
+				rx_ack_fifo_full_count++;
 				//ksprintf( message, "sv3eth_service: Len FIFO full. Cannot ACK RX pkt\r\n" );
 				//c_conws( message );
 			}

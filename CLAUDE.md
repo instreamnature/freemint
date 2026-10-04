@@ -122,7 +122,18 @@ utan att allt behöver förklaras igen. Svara på svenska.
 - **Resultat (2026-10-02):** i konsolläge 3 timmar utan krasch (32k paket in,
   13k ut), mot högst 10 minuter före ändringen. FTP av en 3 MB zip från
   Falcon till PC: md5sum stämmer, ~1,3 MB/s, alla räknare 0 utom de
-  `rx_if_input_fail` som kom vid uppstart. Återstår: test med XaAES.
+  `rx_if_input_fail` som kom vid uppstart.
+- **XaAES-test (2026-10-02):** ca 4,5 timmar med XaAES utan krasch, ca 66k
+  paket in och 36k ut (förut krasch inom ~1 timme). Kraschen räknas som löst.
+- Efter commit `8766d573`: gammal utkommenterad RX-kod borttagen ur
+  `sv3eth_service()`, tömningen av mailboxen utbruten till
+  `sv3eth_flush_mailbox()` och anropad i både `driver_init()` och
+  `sv3eth_open()`, `spl7()` runt IE-avstängningen även i `driver_init()` och
+  `sv3eth_close()`, och en fjärde `stats`-rad med antal kastade poster vid
+  init och open. Tömningen vid open tog **inte** bort felen vid uppstart
+  (24 `rx_if_input_fail` efter första försöket). Texten från `sv3eth_open`
+  syns inte i `boot.log`, eftersom `ifconfig en0 up` körs från `/etc/rc`
+  efter att bootloggen stängts.
 
 ## Avbrottsvägen i hårdvaran (spår, ej bekräftat)
 
@@ -257,9 +268,16 @@ att grafikdrivrutinens VRAM-allokering kan överlappa `0x9F000000`
    `sv3eth_output` och skydda `send_packet()` med `splhigh()`/`spl()` i
    stället. Färre mailboxåtkomster bör ge färre krascher. Nästa fel-PC visar
    om det är andra mailboxåtkomster som drabbas.
-3. (Klart) `in_errors` = `rx_if_input_fail`, alltså full mottagningskö,
-   främst vid uppstart (avbrottsbiten kvar i mailboxen efter reset) och
-   under stora nedladdningar. Rättning av avbrottsbiten väntar.
+3. `in_errors` vid uppstart: ibland `rx_if_input_fail`, ibland
+   `rx_buf_alloc_fail` (62–272 st). **Inte** p.g.a. kvarstående IE: enligt
+   VHDL-koden nollställer CT60-reset de fyra IE-bitarna (en per mailbox;
+   bara mbox0 används). Mailbox-FIFO:erna i Xilinx-IP:t nollställs däremot
+   inte. Trolig orsak: ARM-sidan samlar paket mellan `driver_init()` och
+   `ifconfig en0 up`. När IE slås på i `sv3eth_open()` tar ISR:en hela
+   backloggen på nivå 6 i ett svep, så att mottagningskön (60) eller
+   buffertpoolen tar slut. `IFF_UP|IFF_RUNNING` sätts direkt efter
+   `open` (if.c:390). Förslag: töm och kvittera mailboxen i
+   `sv3eth_open()` innan IE slås på.
 4. Möjliga senare ändringar: ISR med assembler-omslag som i SV2, eller låta
    ISR:en bara kvittera och schemalägga `sv3eth_service` via
    `addroottimeout(0, ..., 1)`.

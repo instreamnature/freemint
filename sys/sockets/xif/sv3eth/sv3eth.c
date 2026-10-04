@@ -163,6 +163,13 @@ static volatile uint32_t tx_fifo_full_post_count	= 0;   // send_packet(): Len FI
 static volatile uint32_t rx_buf_alloc_fail_count	= 0;   // buf_alloc() failed for an RX packet
 static volatile uint32_t rx_if_input_fail_count	= 0;   // if_input() failed, RX queue full
 
+// Number of entries thrown away by sv3eth_flush_mailbox(), last call from
+// driver_init() and from sv3eth_open() respectively.
+static uint32_t init_flush_rx = 0;
+static uint32_t init_flush_tx = 0;
+static uint32_t open_flush_rx = 0;
+static uint32_t open_flush_tx = 0;
+
 
 /// Init internal flags array for the DMA buffers in SVRAM
 void Init_DMA_slot_info(void)
@@ -173,6 +180,61 @@ void Init_DMA_slot_info(void)
 		tx_dma_pkt_flags[i] = 0;
 	}
 	tx_dma_pos = 0;
+}
+
+
+
+/*
+ * Throw away everything waiting in the length mailbox. RX packets are
+ * ACKed back to the Linux side so their slots are freed, and TX ACKs
+ * free our TX slots. Must be called with the mailbox RX interrupt
+ * disabled, and only from process context since it prints with c_conws().
+ * The number of thrown away RX packets and TX ACKs are returned in
+ * *rx_out and *tx_out.
+ */
+static void
+sv3eth_flush_mailbox (const char *caller, uint32_t *rx_out, uint32_t *tx_out)
+{
+	uint32 rx_pkts = 0;
+	uint32 tx_acks = 0;
+
+	while ( (mbox0.stat_ctrl & MBOX_STAT_RX_LFIFO_EMPTY) == 0 )
+	{
+		//Read length mailbox to get info about next packet
+		//Bottom word is number of bytes
+		//Top word is RX slot index to read packet from
+		uint32_t len_val = mbox0.len_fifo;
+		uint32_t len     = len_val & 0xFFFF;
+		uint32_t raw_pos = len_val >> 16;
+		uint32_t pos;
+
+		if ( raw_pos >= PS_DMA_BUFFER_PKTS )
+		{
+			bad_slot_count++;
+		}
+		pos = raw_pos & (PS_DMA_BUFFER_PKTS - 1);
+
+		if ( len == 0xFFFF )
+		{
+			//This is a special encoding that tells us to clear the
+			//TX flag for the given slot
+			tx_dma_pkt_flags[pos] = 0;
+			tx_acks++;
+		}
+		else
+		{
+			//This is a real RX-packet
+			//Send ACK to the sender that we have handled this packet
+			write_len_fifo_ctrl( (pos << 16) | 0xFFFFUL );
+			rx_pkts++;
+		}
+	}
+
+	*rx_out = rx_pkts;
+	*tx_out = tx_acks;
+
+	ksprintf(message, "%s: Deleted %lu RX pkts and %lu TX ACKs\r\n", caller, rx_pkts, tx_acks );
+	c_conws(message);
 }
 
 
@@ -190,6 +252,12 @@ sv3eth_open (struct netif *nif)
 
 	c_conws("SV3ETH up!\n\r");
 
+	//Packets that arrived while the interface was down (e.g. during boot,
+	//between driver_init() and 'ifconfig en0 up') are old. Throw them away,
+	//otherwise the ISR gets the whole backlog at once and overflows the
+	//MintNet receive queue and buffer pool.
+	sv3eth_flush_mailbox("sv3eth_open", &open_flush_rx, &open_flush_tx);
+
 	//Enable RX interrupt for length mailbox0
 	mbox0.stat_ctrl |= MBOX_STAT_RX_LFIFO_IE;
 
@@ -206,8 +274,14 @@ sv3eth_open (struct netif *nif)
 static long
 sv3eth_close (struct netif *nif)
 {
-	//disable RX interrupt sources BEFORE removing I6 handler
-	mbox0.stat_ctrl &= ~MBOX_STAT_RX_LFIFO_IE;
+	//disable RX interrupt sources BEFORE removing I6 handler.
+	//Mask CPU interrupts while doing it, so an IRQ6 that is already on its
+	//way is not withdrawn in the middle of an IACK cycle (bus error).
+	{
+		ushort sr = spl7();
+		mbox0.stat_ctrl &= ~MBOX_STAT_RX_LFIFO_IE;
+		spl(sr);
+	}
 
 	c_conws("SV3ETH down!\n\r");
 
@@ -697,6 +771,10 @@ sv3eth_config (struct netif *nif, struct ifopt *ifo)
 		ksprintf (message, "sv3eth stats: rx_buf_alloc_fail %lu, rx_if_input_fail %lu\r\n",
 		          rx_buf_alloc_fail_count, rx_if_input_fail_count);
 		c_conws (message);
+		ksprintf (message, "sv3eth stats: flushed at init %lu RX %lu TX-ACK, "
+		          "at open %lu RX %lu TX-ACK\r\n",
+		          init_flush_rx, init_flush_tx, open_flush_rx, open_flush_tx);
+		c_conws (message);
 		return 0;
 	}
 
@@ -749,8 +827,6 @@ long driver_init (void)
 	long	ferr;
 	short	fhandle;
 	char	macbuf[13];
-	uint32	rx_pkts = 0;
-	uint32	tx_acks = 0;
 
 	c_conws("\r\n");
 	c_conws("*************************************\n\r");
@@ -1087,61 +1163,21 @@ long driver_init (void)
 	}
 	#endif
 
+	//Make sure the RX interrupt is off before we drain the mailbox and
+	//install our vector. A CT60 reset clears this bit in the FPGA (the
+	//IE bits of all four mailboxes), but don't rely on that. It is turned
+	//on again in sv3eth_open(). Mask CPU interrupts while doing it, so an
+	//IRQ6 that is already on its way is not withdrawn in the middle of an
+	//IACK cycle.
+	{
+		ushort sr = spl7();
+		mbox0.stat_ctrl &= ~MBOX_STAT_RX_LFIFO_IE;
+		spl(sr);
+	}
+
 	//Clear any waiting RX packets in the mailbox
 	//by sending a TX ACK reply for each such packet
-	{
-		//c_conws("driver_init: Clearing waiting RX packets...\n\r");
-		while ( (mbox0.stat_ctrl & MBOX_STAT_RX_LFIFO_EMPTY) == 0 )
-		{
-			//Length mailbox is not empty
-
-			//Read length mailbox to get info about next packet
-			//Bottom word is number of bytes
-			//Top word is RX slot index to read packet from
-			uint32_t len_val = mbox0.len_fifo;
-			uint32_t len     = len_val & 0xFFFF;
-			uint32_t raw_pos = len_val >> 16;
-			uint32_t pos     = 0;
-	
-			if ( raw_pos >= PS_DMA_BUFFER_PKTS )
-			{
-				bad_slot_count++;
-			}
-			pos = raw_pos & (PS_DMA_BUFFER_PKTS - 1);
-
-			if ( len == 0xFFFF )
-			{
-				//This is a special encoding that tells us to clear the
-				//TX flag for the given slot
-				tx_dma_pkt_flags[pos] = 0;
-				tx_acks++;
-				//c_conws("T");
-			}
-			else
-			{
-				//This is a real RX-packet
-				//Send ACK to the sender that we have handled this packet
-				//while ( mbox0.stat_ctrl & MBOX_STAT_TX_LFIFO_FULL );
-				//Len FIFO not full, send ACK msg
-				//mbox0.len_fifo = len_val | 0xFFFFUL;
-
-				write_len_fifo_ctrl( (pos << 16) | 0xFFFFUL );
-				rx_pkts++;
-				//c_conws("R");
-			}
-
-			//Print a newline if sum of FIFO words modulo 80 shows we have reached
-			//the end of the current line
-			//if (((tx_acks + rx_pkts) % 80) == 0 )
-			//{
-			//	c_conws("\r\n");
-			//}
-		}
-
-		ksprintf(message, "driver_init: Deleted %lu RX pkts and %lu TX ACKs\r\n", rx_pkts, tx_acks );
-		c_conws(message);
-		//Bconin(2);
-	}
+	sv3eth_flush_mailbox("driver_init", &init_flush_rx, &init_flush_tx);
 
 
 	// Install interrupt handler	
@@ -1421,125 +1457,6 @@ static void sv3eth_service (struct netif * nif, uint32 int_src)
 					nif->in_errors++;
 					//c_conws("Input packet failed when receiving!\n\r");
 				}
-
-				/*
-				//OLD:
-				//dstart must be on whole word, but we set to whole longword.
-				//should make the 060 use longword accesses and not risk that
-				//it is split into byte-word-byte.
-				//NEW: 
-				//We want the ip packet to start at even longword. So ethernet
-				//header must start 14 bytes before that.
-				//The allocation we did above using buf_alloc has
-				//dstart=dend=BUF.data[64]
-
-				//ksprintf (message, "buf.dstart=0x%08lx, dend=0x%08lx \n\r", (uint32)b->dstart, (uint32)b->dend );
-				//ksprintf (message, "Allocation:   buf.dstart=%p, dend=%p \n\r", (void*)b->dstart, (void*)b->dend );
-				//c_conws(message);
-
-				//First round down to even longword
-				b->dstart = (char*)(((uint32)(b->dstart)) & 0xFFFFFFFCUL);
-				b->dend   = (char*)(((uint32)(b->dend))   & 0xFFFFFFFCUL);
-
-				//ksprintf (message, "After round to 4:   buf.dstart=%p, dend=%p \n\r", (void*)b->dstart, (void*)b->dend );
-				//c_conws(message);
-
-				//Then remove 14 bytes for the ethernet ehader, so the IP header will
-				//start at even longword after copying of our data
-				b->dstart -= 14;
-				b->dend   -= 14;
-
-				//ksprintf (message, "After sub 14: buf.dstart=%p, dend=%p \n\r", (void*)b->dstart, (void*)b->dend );
-				//c_conws(message);
-
-				//Copy the ethernet frame from src to dest using longword moves
-				//But the src is even 4 bytes and the dest is even 2 bytes and not even 4 bytes
-				//So to get any performance in the memory operations we need to read longwords
-				//from src and shift the data 16 bits in a local variable before writing to dest.
-				{
-					int i;
-					uint32_t current_lword;
-					uint32_t save_from_previous = 0;
-					int longwords_to_write = (length + 2 + 3) >> 2; // Totalt antal 32-bitars skrivningar
-					
-					// Förutsättning: b->dstart har redan ökats med 2.
-					// Vi skapar en 32-bitars justerad pekare som pekar 2 bytes *innan* dstart,
-					// vilket gör att när vi skriver till dst[0], skriver vi egentligen till de 2 pad-bytesen
-					// och de första 2 bytesen av din Ethernet-header.
-					dest = (uint32_t*)((char *)b->dstart - 2);
-
-					for ( i = 0; i < longwords_to_write; i++)
-					{
-						// 1. Läs 32 bitar från FPGA:n [A, B, C, D]
-						current_lword = *src++;
-						
-						// 2. Kombinera det sparade från förra varvet (till vänster) 
-						//    med det nya ordet skiftat 16 bitar till höger [0, 0, A, B]
-						*dest++ = save_from_previous | (current_lword >> 16);
-						
-						// 3. Spara de utskiftade 16 bitarna [C, D] till nästa varv 
-						//    genom att skifta dem 16 bitar till vänster -> [C, D, 0, 0]
-						save_from_previous = current_lword << 16;
-					}
-
-					// Om det finns restdata kvar i save_from_previous efter loopen (vid udda längder),
-					// skriver vi ut det sista blocket.
-					if ((length + 2) & 3)
-					{
-						*dest = save_from_previous;
-					}
-				}
-
-
-				//OLD:
-				//read the data, rounded up to even longwords
-				//dest = (uint32*)(b->dstart);
-				//for ( i=0; i < len_longs-2; i++ )
-				//{
-				//	*dest++ = *src++;
-				//}
-				
-//				b->dend += length - 4;							//TODO: should we subtract 4 here, to skip the CRC?
-//				b->dend += (uint32)(length - 4UL);				//TODO: should we subtract 4 here, to skip the CRC?
-				b->dend += (uint32)(length - 0UL);				//No CRC to remove
-				if ( (b->dend) < (b->dstart) )
-				{
-					//c_conws("SV3ETH RX: dend < dstart!\r\n");
-				}
-				
-				#if 0
-				//Print packet start and end data
-				ksprintf (message, "RX slot %2lu, %4lu bytes: %08lx %08lx %08lx %08lx ... %08lx %08lx\r\n",
-								slot,
-								length,
-								origsrc[0],
-								origsrc[1],
-								origsrc[2],
-								origsrc[3],
-								origsrc[len_longs-2],
-								origsrc[len_longs-1]
-							);
-				c_conws (message);
-				#endif
-
-				// Pass packet to upper layers
-				if (nif->bpf)
-					bpf_input (nif, b);
-	
-				type = eth_remove_hdr(b);
-
-				//ksprintf (message, "RX Ether type: 0x%04x, length %lu, dstart %p, dend-dstart %lu \n\r", type, length, b->dstart, (uint32_t)(b->dend - b->dstart));
-				//c_conws  (message);
-
-				// and enqueue packet
-				if(!if_input(nif, b, 0UL, type))
-					nif->in_packets++;
-				else
-				{
-					nif->in_errors++;
-					c_conws("Input packet failed when receiving!\n\r");
-				}
-				*/
 			}
 				
 			ACK_PACKET :

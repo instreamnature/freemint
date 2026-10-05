@@ -134,6 +134,71 @@ utan att allt behöver förklaras igen. Svara på svenska.
   (24 `rx_if_input_fail` efter första försöket). Texten från `sv3eth_open`
   syns inte i `boot.log`, eftersom `ifconfig en0 up` körs från `/etc/rc`
   efter att bootloggen stängts.
+- Commit `22cb297b` (2026-10-03). Därefter: inga fel vid uppstart, och
+  flushed = 56 RX både vid init och open. Trolig orsak: ARM-sidans
+  Linux-drivrutin fyller sina lediga RX-slottar och väntar, och 8 av 64
+  slottar har gått förlorade där (aldrig kvitterade före Falcon-reset eller
+  krasch). Tidigare raderade `driver_init` 61. Nästa steg: åtgärda i
+  Linux-drivrutinen, t.ex. med ett "Falcon har startat om"-ord från
+  `driver_init()` som frigör alla RX-slottar, eller timeout per slot.
+- Hastighet: FTP av 16 MB från `/ram/` på Falcon gav 2,59–2,61 MB/s (från
+  disk ~1,35 MB/s), så disken var flaskhalsen vid de tidigare mätningarna.
+
+## Linux-drivrutinen på ARM-sidan (sv3mboxdriver)
+
+- Virtuell Ubuntu: `instream@192.168.10.17` (ssh-nyckel `id_ed25519` från
+  Cygwin, `-o BatchMode=yes`). Kodträd:
+  `/home/instream/SV3_petalinux/SV3_petalinux_2023.1/project-spec/meta-user/recipes-modules/sv3mboxdriver/files/sv3mboxdriver.c`
+  (git-repo i `/home/instream/SV3_petalinux`).
+- Linux "TX" = Falcon RX. `find_next_free_tx_slot()` sätter
+  `tx_psdma_buf_flags[pos]`. Den frigörs bara av ACK från Falcon i
+  `sv3mboxdriver_poll()`. Ingen timeout och ingen återställning.
+- Mailbox-FIFO-djup 1024 (`pl.dtsi`), så FIFO-overflow är inte orsaken.
+- **Trolig orsak till förlorade slottar:** ett ord i CT60-domänens
+  hållregister mellan AXI-stream och `len_fifo` försvinner vid Falcon-reset
+  (Xilinx-mailboxen nollställs inte). RX-info som tappas kvitteras aldrig.
+  **Bekräftat (2026-10-05):** i Vivado-blockschemat sitter AXI4-Stream
+  Register Slices på AXIS-bussarna mellan mailboxarna och
+  68060-registergränssnittet (90 MHz CT60-domänen, ARM-sidan 200 MHz), och
+  de nollställs med `ct60_reset`. De behövdes för att klara timing. Ord i
+  dem (och i registergränssnittet) försvinner vid Falcon-reset, i båda
+  riktningarna. En Falcon-krasch mellan läsning av `len_fifo` och ACK
+  förlorar också en slot, så rättningen görs i mjukvara (handslag med
+  `0xFFFEFFFF`, Falcon faller tillbaka på tömning med ACK om svar uteblir).
+- **Förslag:** omstartshandslag. `driver_init()` skickar `0xFFFEFFFF`,
+  Linux frigör alla TX-slottar och svarar med samma ord, och Falcon kastar
+  allt utan ACK tills svaret kommer.
+- Andra fynd: `dev_info()` per paket (irq/xmit/poll), en stor
+  prestandabroms. `pos` och `len` från mailboxen kontrolleras inte
+  (out-of-bounds på `tx_psdma_buf_flags[]` och DMA-området).
+- **Gjort (2026-10-05), ej committat i Ubuntu-repot:** `sv3mboxdriver.c` har
+  handslaget (`SV3_RESYNC_WORD` i `poll()`), kontroll av `pos`/`len`,
+  `rx_dropped++`, `eth_hw_addr_set()` i `set_mac_address`, och `dev_info`
+  per paket bortkommenterade (`queue full` via `net_ratelimit()`). Byggd med
+  `petalinux-build -c sv3mboxdriver -x compile` (efter
+  `source ~/Petalinux2023.1/settings.sh`). `.ko` hamnar i
+  `build/tmp/work/zynq_generic_7z020-xilinx-linux-gnueabi/sv3mboxdriver/1.0-r0/`.
+- Modulen är en laddbar modul i rootfs (`CONFIG_sv3mboxdriver=y` i
+  `project-spec/configs/rootfs_config`, `KERNEL_MODULE_AUTOLOAD`). På SV3:
+  `/lib/modules/6.1.0-xilinx-v2023.1/extra/sv3mboxdriver.ko`. Snabb
+  uppdatering: `sudo scp` av `.ko` till SV3 från användarens ssh-session på
+  Ubuntu (Claude saknar nyckel till `root@192.168.10.86`). Backup:
+  `/home/root/sv3mboxdriver.ko.orig`. Root-hemkatalog på SV3 är `/home/root`.
+  **Starta inte om SV3 med `reboot`** (FPGA:n programmeras om och Falcon
+  fryser): `shutdown -h now` och strömcykla. Fullt: `petalinux-build` +
+  `rsync_rootfs_to_zturn.sh`.
+- `dmesg`-meddelandet `queue full, stopping kernel TX queue` innan Falcon
+  har startat MiNT är normalt.
+- Efter strömcykling men före handslaget: flushed 62/62, alltså 2 slottar
+  förlorade redan vid strömpåslaget, i riktningen Linux → Falcon. Orsaken är
+  okänd. `RESET`-instruktionen och Ctrl-Alt-Del nollställer **inte**
+  FPGA-logiken, bara reset-knappen och strömpåslaget gör det.
+- **Resultat handslag (2026-10-05):** `sv3eth.c` med
+  `sv3eth_resync_mailbox()` (7 157 byte, föregående som `sv3eth26.xix`).
+  Efter reset-knapp: `resync OK, threw away 58 RX`, flushed at init 0 och at
+  open **64**, inga in-/out-errors vid uppstart, och `dmesg` visar
+  `resync from 060, all TX slots freed`. Hastighet med tyst Linux-modul:
+  ~2,6 MB/s från `/ram/`, alltså oförändrad.
 
 ## Avbrottsvägen i hårdvaran (spår, ej bekräftat)
 
@@ -261,14 +326,12 @@ att grafikdrivrutinens VRAM-allokering kan överlappa `0x9F000000`
 
 ## Nästa steg
 
-1. FPGA-sidan: undersök hur skrivningar till mailboxregistren (`0x80013000`)
-   kvitteras mot CT60, och om samtidig åtkomst från ARM-sidan eller
-   klockdomänövergången kan ge utebliven TA eller TEA.
-2. Mjukvarutest: ta bort läs-modifiera-skriv av `stat_ctrl` i
-   `sv3eth_output` och skydda `send_packet()` med `splhigh()`/`spl()` i
-   stället. Färre mailboxåtkomster bör ge färre krascher. Nästa fel-PC visar
-   om det är andra mailboxåtkomster som drabbas.
-3. `in_errors` vid uppstart: ibland `rx_if_input_fail`, ibland
+1. (Klart) Kraschen löst med `spl7()` i stället för IE-växling, och
+   handslaget löser de förlorade slottarna.
+2. Committa `sv3eth.c` (handslaget) och `sv3mboxdriver.c` i respektive repo.
+3. Hastighet: väntslingan på 1000 `nop` i `send_packet`, MOVE16-kopiering,
+   och läckan i `send_packet` vid `tx_fifo_full_post`.
+4. (Historik) `in_errors` vid uppstart, nu borta efter handslaget: ibland `rx_if_input_fail`, ibland
    `rx_buf_alloc_fail` (62–272 st). **Inte** p.g.a. kvarstående IE: enligt
    VHDL-koden nollställer CT60-reset de fyra IE-bitarna (en per mailbox;
    bara mbox0 används). Mailbox-FIFO:erna i Xilinx-IP:t nollställs däremot
@@ -278,7 +341,7 @@ att grafikdrivrutinens VRAM-allokering kan överlappa `0x9F000000`
    buffertpoolen tar slut. `IFF_UP|IFF_RUNNING` sätts direkt efter
    `open` (if.c:390). Förslag: töm och kvittera mailboxen i
    `sv3eth_open()` innan IE slås på.
-4. Möjliga senare ändringar: ISR med assembler-omslag som i SV2, eller låta
+5. Möjliga senare ändringar: ISR med assembler-omslag som i SV2, eller låta
    ISR:en bara kvittera och schemalägga `sv3eth_service` via
    `addroottimeout(0, ..., 1)`.
 

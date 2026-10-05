@@ -62,6 +62,23 @@
 // 1518 = with support for 802.1Q VLAN-tag (14+4 header + 1500 payload)
 #define SV3ETH_MAX_RX_LEN   1518UL
 
+// Mailbox word used for the restart handshake with the Linux driver
+// (sv3mboxdriver). Length 0xFFFF means ACK, but slot 0xFFFE is never a
+// valid slot, so it can't be mistaken for a real ACK. driver_init() sends
+// it, the Linux side frees all its slots towards us and sends it back.
+// Everything before the answer is stale and thrown away without ACK.
+// Words that were in flight in the AXIS register slices when the Falcon
+// was reset are lost, so without this the Linux side loses slots.
+// NOTE: An old Linux driver without the handshake treats this word as an
+// ACK for slot 0xFFFE and writes outside its flag array.
+#define SV3_RESYNC_WORD     0xFFFEFFFFUL
+
+// How long driver_init() waits for the answer, in 200 Hz ticks (1 second)
+#define SV3_RESYNC_TIMEOUT  200L
+
+// The 200 Hz system timer (TOS variable _hz_200)
+#define SV3_HZ_200          (*(volatile long *)0x4baL)
+
 /*
  * From main.c
  */
@@ -170,6 +187,12 @@ static uint32_t init_flush_tx = 0;
 static uint32_t open_flush_rx = 0;
 static uint32_t open_flush_tx = 0;
 
+// Result of the restart handshake in driver_init()
+static uint32_t resync_ok          = 0;   // 1 if the Linux side answered
+static uint32_t resync_discard_rx  = 0;   // stale RX packets thrown away without ACK
+static uint32_t resync_discard_ack = 0;   // stale TX ACKs thrown away
+static volatile uint32_t late_resync_count = 0;   // answers that came after driver_init()
+
 
 /// Init internal flags array for the DMA buffers in SVRAM
 void Init_DMA_slot_info(void)
@@ -208,6 +231,13 @@ sv3eth_flush_mailbox (const char *caller, uint32_t *rx_out, uint32_t *tx_out)
 		uint32_t raw_pos = len_val >> 16;
 		uint32_t pos;
 
+		if ( len_val == SV3_RESYNC_WORD )
+		{
+			//Late answer to the restart handshake, not a slot
+			late_resync_count++;
+			continue;
+		}
+
 		if ( raw_pos >= PS_DMA_BUFFER_PKTS )
 		{
 			bad_slot_count++;
@@ -235,6 +265,94 @@ sv3eth_flush_mailbox (const char *caller, uint32_t *rx_out, uint32_t *tx_out)
 
 	ksprintf(message, "%s: Deleted %lu RX pkts and %lu TX ACKs\r\n", caller, rx_pkts, tx_acks );
 	c_conws(message);
+}
+
+
+
+/*
+ * Restart handshake with the Linux driver. Send SV3_RESYNC_WORD and throw
+ * away everything in the mailbox until the Linux side sends it back. The
+ * Linux side has then freed all its slots towards us, so the thrown away
+ * RX packets must NOT be ACKed (the slots may already be reused).
+ *
+ * If no answer comes within SV3_RESYNC_TIMEOUT (old Linux driver, or the
+ * sv30 interface is down), the held back RX slots are ACKed instead, so
+ * the Linux side gets them back the old way.
+ *
+ * Returns 1 if the Linux side answered, 0 on timeout. Must be called with
+ * the mailbox RX interrupt disabled, from process context.
+ */
+static int
+sv3eth_resync_mailbox (void)
+{
+	uint32_t held_rx[2] = { 0, 0 };	//bitmask of RX slots thrown away
+	uint32_t loops      = 0;
+	long     start;
+	uint32_t pos;
+
+	resync_discard_rx  = 0;
+	resync_discard_ack = 0;
+
+	write_len_fifo_ctrl( SV3_RESYNC_WORD );
+	start = SV3_HZ_200;
+
+	//The loop counter is a backup in case the 200 Hz timer is not running
+	while ( (SV3_HZ_200 - start) < SV3_RESYNC_TIMEOUT && loops < 20000000UL )
+	{
+		uint32_t len_val;
+		uint32_t len;
+		uint32_t raw_pos;
+
+		loops++;
+
+		if ( (mbox0.stat_ctrl & MBOX_STAT_RX_LFIFO_EMPTY) != 0 )
+			continue;
+
+		len_val = mbox0.len_fifo;
+
+		if ( len_val == SV3_RESYNC_WORD )
+		{
+			resync_ok = 1;
+			ksprintf(message, "driver_init: resync OK, threw away %lu RX pkts and %lu TX ACKs\r\n",
+			         resync_discard_rx, resync_discard_ack );
+			c_conws(message);
+			return 1;
+		}
+
+		len     = len_val & 0xFFFF;
+		raw_pos = len_val >> 16;
+
+		if ( raw_pos >= PS_DMA_BUFFER_PKTS )
+		{
+			bad_slot_count++;
+			continue;
+		}
+
+		if ( len == 0xFFFF )
+		{
+			resync_discard_ack++;
+		}
+		else
+		{
+			held_rx[raw_pos >> 5] |= 1UL << (raw_pos & 31);
+			resync_discard_rx++;
+		}
+	}
+
+	//No answer. ACK the RX slots we held back, so they are not lost.
+	resync_ok = 0;
+	for ( pos = 0; pos < PS_DMA_BUFFER_PKTS; pos++ )
+	{
+		if ( held_rx[pos >> 5] & (1UL << (pos & 31)) )
+		{
+			write_len_fifo_ctrl( (pos << 16) | 0xFFFFUL );
+		}
+	}
+
+	ksprintf(message, "driver_init: no resync answer from Linux side, ACKed %lu RX pkts\r\n",
+	         resync_discard_rx );
+	c_conws(message);
+	return 0;
 }
 
 
@@ -775,6 +893,11 @@ sv3eth_config (struct netif *nif, struct ifopt *ifo)
 		          "at open %lu RX %lu TX-ACK\r\n",
 		          init_flush_rx, init_flush_tx, open_flush_rx, open_flush_tx);
 		c_conws (message);
+		ksprintf (message, "sv3eth stats: resync %s, threw away %lu RX %lu TX-ACK, "
+		          "late resync %lu\r\n",
+		          resync_ok ? "OK" : "TIMEOUT", resync_discard_rx, resync_discard_ack,
+		          late_resync_count);
+		c_conws (message);
 		return 0;
 	}
 
@@ -1175,9 +1298,13 @@ long driver_init (void)
 		spl(sr);
 	}
 
-	//Clear any waiting RX packets in the mailbox
-	//by sending a TX ACK reply for each such packet
-	sv3eth_flush_mailbox("driver_init", &init_flush_rx, &init_flush_tx);
+	//Restart handshake with the Linux side, so slots that were lost in a
+	//Falcon reset are freed there. If it doesn't answer, clear any waiting
+	//RX packets in the mailbox by sending an ACK for each one, as before.
+	if ( !sv3eth_resync_mailbox() )
+	{
+		sv3eth_flush_mailbox("driver_init", &init_flush_rx, &init_flush_tx);
+	}
 
 
 	// Install interrupt handler	
@@ -1253,7 +1380,15 @@ int32 Check_Rx_Buffers()
 		uint32_t raw_pos = len_val >> 16;
 		uint32_t pos     = 0;
 		//printf( "Mailbox0 pos is %u, length is %u\r\n", pos, len );
-	
+
+		if ( len_val == SV3_RESYNC_WORD )
+		{
+			//Late answer to the restart handshake (the Linux interface was
+			//probably down when driver_init() ran). Not a slot, skip it.
+			late_resync_count++;
+			continue;
+		}
+
 		// Defensive masking: raw_pos comes straight from the hardware
 		// mailbox and is a full 16-bit value, but we only have
 		// PS_DMA_BUFFER_PKTS slots. Count it if it was ever out of range,

@@ -571,8 +571,9 @@ static void show_stats(unsigned short port)
 	sprintf(line, "  port:   announced %u credited %u carrier %u tx_credit %lu credit_owed %lu\r\n",
 			p->announced, p->credited, p->carrier, p->tx_credit, p->credit_owed);
 	stats_line(port, line);
-	sprintf(line, "  buffer: rx_buf %lu tx_buf %lu rx_total %lu\r\n",
-			p->rx.head - p->rx.tail, p->tx.head - p->tx.tail, p->rx.head);
+	sprintf(line, "  buffer: rx_buf %ld tx_buf %ld rx_total %lu (rx head %d tail %d)\r\n",
+			sv3p_rx_count(&proto, port), (long)(TXSIZE - 1) - sv3p_tx_room(&proto, port),
+			p->rx_total, SV3P_RX(p)->head, SV3P_RX(p)->tail);
 	stats_line(port, line);
 	sprintf(line, "  rx:     msgs %lu bytes %lu dropped %lu\r\n",
 			proto.rx_msgs, proto.rx_bytes, proto.rx_dropped);

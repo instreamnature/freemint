@@ -47,9 +47,15 @@
 /* Ring buffer helpers                                                */
 /* ================================================================== */
 
+/*
+ * The buffers use the TOS IOREC layout, see SV3P_IOREC in sv3tty_proto.h:
+ * head = index of the byte last read, tail = index of the byte last
+ * written, empty when head == tail, capacity buflen - 1.
+ */
+
 /// @brief		Empty a ring buffer
 /// @param r	Ring buffer
-static void ring_reset(struct sv3p_ring *r)
+static void ring_reset(SV3P_IOREC *r)
 {
 	r->head = 0;
 	r->tail = 0;
@@ -59,36 +65,47 @@ static void ring_reset(struct sv3p_ring *r)
 /// @brief		Number of bytes in a ring buffer
 /// @param r	Ring buffer
 /// @return		Bytes that can be read
-static unsigned long ring_count(const struct sv3p_ring *r)
+static unsigned long ring_count(const SV3P_IOREC *r)
 {
-	return r->head - r->tail;
+	long n = (long)r->tail - (long)r->head;
+
+	if (n < 0)
+		n += r->buflen;
+	return (unsigned long)n;
 }
 
 
 /// @brief		Free space in a ring buffer
 /// @param r	Ring buffer
 /// @return		Bytes that can be written
-static unsigned long ring_room(const struct sv3p_ring *r)
+static unsigned long ring_room(const SV3P_IOREC *r)
 {
-	return r->size - (r->head - r->tail);
+	return (unsigned long)(r->buflen - 1) - ring_count(r);
 }
 
 
-/// @brief		Copy bytes into a ring buffer, as many as fit
+/// @brief		Copy bytes into a ring buffer, as many as fit. The tail index
+///				is updated once, after the data, so a reader on the other
+///				side (interrupt or program) never sees unwritten bytes.
 /// @param r	Ring buffer
 /// @param src	Bytes to write
 /// @param len	Number of bytes
 /// @return		Number of bytes written
-static unsigned long ring_put(struct sv3p_ring *r, const unsigned char *src, unsigned long len)
+static unsigned long ring_put(SV3P_IOREC *r, const unsigned char *src, unsigned long len)
 {
 	unsigned long n = ring_room(r);
 	unsigned long i;
+	short t = r->tail;
 
 	if (len < n)
 		n = len;
 	for (i = 0; i < n; i++)
-		r->buf[(r->head + i) & (r->size - 1)] = src[i];
-	r->head += n;
+	{
+		if (++t >= r->buflen)
+			t = 0;
+		r->bufaddr[t] = src[i];
+	}
+	r->tail = t;
 	return n;
 }
 
@@ -98,16 +115,49 @@ static unsigned long ring_put(struct sv3p_ring *r, const unsigned char *src, uns
 /// @param dst	Destination
 /// @param len	Max number of bytes
 /// @return		Number of bytes copied
-static unsigned long ring_peek(const struct sv3p_ring *r, unsigned char *dst, unsigned long len)
+static unsigned long ring_peek(const SV3P_IOREC *r, unsigned char *dst, unsigned long len)
 {
 	unsigned long n = ring_count(r);
 	unsigned long i;
+	short h = r->head;
 
 	if (len < n)
 		n = len;
 	for (i = 0; i < n; i++)
-		dst[i] = r->buf[(r->tail + i) & (r->size - 1)];
+	{
+		if (++h >= r->buflen)
+			h = 0;
+		dst[i] = r->bufaddr[h];
+	}
 	return n;
+}
+
+
+/// @brief		Remove bytes from a ring buffer (after ring_peek)
+/// @param r	Ring buffer
+/// @param n	Number of bytes, at most ring_count(r)
+static void ring_skip(SV3P_IOREC *r, unsigned long n)
+{
+	long h = (long)r->head + (long)n;
+
+	if (h >= r->buflen)
+		h -= r->buflen;
+	r->head = (short)h;
+}
+
+
+/// @brief		Set up a ring buffer
+/// @param r	Ring buffer
+/// @param buf	Memory for it
+/// @param size	Size in bytes, 16..32767
+static void ring_init(SV3P_IOREC *r, unsigned char *buf, unsigned long size)
+{
+	r->bufaddr   = buf;
+	r->buflen    = (short)size;
+	r->head      = 0;
+	r->tail      = 0;
+	r->low_water = (short)(size / 4);
+	r->hi_water  = (short)(size * 3 / 4);
 }
 
 
@@ -234,8 +284,8 @@ static void reset_ports(struct sv3p *s)
 		p->credit_owed = 0;
 		if (p->open)
 		{
-			ring_reset(&p->rx);
-			ring_reset(&p->tx);
+			ring_reset(SV3P_RX(p));
+			ring_reset(SV3P_TX(p));
 		}
 	}
 }
@@ -343,7 +393,8 @@ static void rx_data(struct sv3p *s, struct sv3p_port *p, unsigned short len)
 		return;
 	}
 
-	n = ring_put(&p->rx, buf, len);
+	n = ring_put(SV3P_RX(p), buf, len);
+	p->rx_total += n;
 	if (n < len)
 	{
 		// Linux sent more than our window. Should not happen.
@@ -477,14 +528,14 @@ static int tx_port(struct sv3p *s, unsigned short i)
 	// Newly opened (or reopened after a resync): OPEN, then our window
 	if (!p->announced)
 	{
-		ring_reset(&p->rx);
+		ring_reset(SV3P_RX(p));
 		p->credit_owed = 0;
 		p->credited    = 0;
 		p->tx_credit   = 0;
 		if (mb_send(s, SV3P_HDR(SV3P_T_OPEN, i, 0), 0, 0))
 			return -1;
 		p->announced = 1;
-		if (mb_send(s, SV3P_HDR(SV3P_T_CREDIT, i, p->rx.size), 0, 0))
+		if (mb_send(s, SV3P_HDR(SV3P_T_CREDIT, i, SV3P_RX(p)->buflen - 1), 0, 0))
 			return -1;
 		if (p->rows && p->cols)
 			p->send_winsz = 1;
@@ -499,7 +550,7 @@ static int tx_port(struct sv3p *s, unsigned short i)
 	}
 
 	// Return credit for data the program has read, a quarter window at a time
-	if (p->credit_owed && p->credit_owed >= p->rx.size / 4)
+	if (p->credit_owed && p->credit_owed >= (unsigned long)(SV3P_RX(p)->buflen - 1) / 4)
 	{
 		if (mb_send(s, SV3P_HDR(SV3P_T_CREDIT, i, p->credit_owed), 0, 0))
 			return -1;
@@ -507,15 +558,15 @@ static int tx_port(struct sv3p *s, unsigned short i)
 	}
 
 	// Data, as much as the credit allows, in messages of at most 256 bytes
-	while (p->credited && p->tx_credit && ring_count(&p->tx))
+	while (p->credited && p->tx_credit && ring_count(SV3P_TX(p)))
 	{
 		n = SV3P_MAX_PAYLOAD;
 		if (p->tx_credit < n)
 			n = p->tx_credit;
-		n = ring_peek(&p->tx, buf, n);
+		n = ring_peek(SV3P_TX(p), buf, n);
 		if (mb_send(s, SV3P_HDR(SV3P_T_DATA, i, n), buf, n))
 			return -1;
-		p->tx.tail   += n;
+		ring_skip(SV3P_TX(p), n);
 		p->tx_credit -= n;
 	}
 
@@ -626,10 +677,11 @@ void sv3p_poll(struct sv3p *s)
 /// @brief			Open a port. The OPEN is sent by sv3p_poll when the link is up.
 /// @param s		Protocol state
 /// @param port		Port number
-/// @param rxbuf	Receive buffer, its size is the window granted to Linux
-/// @param rxsize	Power of two, 16..32768
+/// @param rxbuf	Receive buffer. It holds rxsize - 1 bytes, which is the
+///					window granted to Linux.
+/// @param rxsize	16..32767
 /// @param txbuf	Transmit buffer
-/// @param txsize	Power of two, 16..32768
+/// @param txsize	16..32767
 /// @param rows		Terminal rows for WINSZ, 0 = do not send
 /// @param cols		Terminal columns for WINSZ
 /// @return			0, or -1 for a bad port or size
@@ -642,18 +694,13 @@ int sv3p_open(struct sv3p *s, unsigned short port,
 
 	if (port >= s->nports)
 		return -1;
-	if (rxsize < 16 || rxsize > 32768 || (rxsize & (rxsize - 1)))
-		return -1;
-	if (txsize < 16 || txsize > 32768 || (txsize & (txsize - 1)))
+	if (rxsize < 16 || rxsize > 32767 || txsize < 16 || txsize > 32767)
 		return -1;
 
 	p = &s->ports[port];
-	p->rx.buf  = rxbuf;
-	p->rx.size = rxsize;
-	p->tx.buf  = txbuf;
-	p->tx.size = txsize;
-	ring_reset(&p->rx);
-	ring_reset(&p->tx);
+	ring_init(SV3P_RX(p), rxbuf, rxsize);
+	ring_init(SV3P_TX(p), txbuf, txsize);
+	p->rx_total  = 0;
 	p->rows      = rows;
 	p->cols      = cols;
 	p->got_break = 0;
@@ -683,7 +730,7 @@ long sv3p_write(struct sv3p *s, unsigned short port, const unsigned char *buf, l
 {
 	if (port >= s->nports || !s->ports[port].open || len <= 0)
 		return 0;
-	return (long)ring_put(&s->ports[port].tx, buf, (unsigned long)len);
+	return (long)ring_put(SV3P_TX(&s->ports[port]), buf, (unsigned long)len);
 }
 
 
@@ -703,8 +750,8 @@ long sv3p_read(struct sv3p *s, unsigned short port, unsigned char *buf, long len
 		return 0;
 
 	p = &s->ports[port];
-	n = ring_peek(&p->rx, buf, (unsigned long)len);
-	p->rx.tail += n;
+	n = ring_peek(SV3P_RX(p), buf, (unsigned long)len);
+	ring_skip(SV3P_RX(p), n);
 	if (p->announced)
 		p->credit_owed += n;
 	return (long)n;
@@ -719,7 +766,7 @@ long sv3p_rx_count(struct sv3p *s, unsigned short port)
 {
 	if (port >= s->nports || !s->ports[port].open)
 		return 0;
-	return (long)ring_count(&s->ports[port].rx);
+	return (long)ring_count(SV3P_RX(&s->ports[port]));
 }
 
 
@@ -731,7 +778,7 @@ long sv3p_tx_room(struct sv3p *s, unsigned short port)
 {
 	if (port >= s->nports || !s->ports[port].open)
 		return 0;
-	return (long)ring_room(&s->ports[port].tx);
+	return (long)ring_room(SV3P_TX(&s->ports[port]));
 }
 
 

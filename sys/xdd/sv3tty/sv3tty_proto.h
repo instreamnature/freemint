@@ -68,15 +68,28 @@ typedef struct
 /* Data structures                                                    */
 /* ------------------------------------------------------------------ */
 
-/* Ring buffer. size must be a power of two. head and tail run freely,
- * the number of bytes in the buffer is head - tail. */
-struct sv3p_ring
+/* Ring buffer in the TOS IOREC layout, so a port's two buffers can be given
+ * to programs through Bconmap/Iorec, and programs that look at the buffer
+ * fill level directly (e.g. FreeMiNT's Bcostat) see the right values.
+ *
+ * As in the TOS serial ports, head is the index of the byte last READ and
+ * tail the index of the byte last WRITTEN. Empty when head == tail. To write:
+ * t = tail + 1 (0 at buflen), full if t == head, else bufaddr[t] = c and
+ * tail = t. To read: h = head + 1 (0 at buflen), c = bufaddr[h], head = h.
+ * So a buffer holds buflen - 1 bytes.
+ *
+ * Each index is written by one side only (the producer writes tail, the
+ * consumer head), and only after the data, so no lock is needed when the
+ * producer is an interrupt and the consumer a program, or the other way. */
+typedef struct
 {
-	unsigned char	*buf;
-	unsigned long	size;
-	unsigned long	head;			/* Write position */
-	unsigned long	tail;			/* Read position */
-};
+	unsigned char	*bufaddr;
+	short			buflen;
+	volatile short	head;			/* Index of the byte last read */
+	volatile short	tail;			/* Index of the byte last written */
+	short			low_water;		/* Not used by us, set for programs */
+	short			hi_water;
+} SV3P_IOREC;
 
 struct sv3p_port
 {
@@ -90,9 +103,15 @@ struct sv3p_port
 	unsigned char	got_break;		/* Linux has sent a BREAK (cleared by the program) */
 	unsigned long	tx_credit;		/* Bytes we may still send to Linux */
 	unsigned long	credit_owed;	/* Bytes read by the program, not yet credited back */
-	struct sv3p_ring rx;			/* Data from Linux; its size is our window */
-	struct sv3p_ring tx;			/* Data to Linux */
+	unsigned long	rx_total;		/* Bytes received since the port was opened */
+	/* io[0]: data from Linux, its capacity (buflen - 1) is our window.
+	 * io[1]: data to Linux. They follow each other, like the two IORECs
+	 * of a TOS serial port, so &io[0] can be used as the port's IOREC. */
+	SV3P_IOREC		io[2];
 };
+
+#define SV3P_RX(p)				(&(p)->io[0])
+#define SV3P_TX(p)				(&(p)->io[1])
 
 struct sv3p
 {
@@ -137,7 +156,8 @@ void sv3p_start(struct sv3p *s);
 void sv3p_poll(struct sv3p *s);
 
 /* Open a port. rxbuf/txbuf must stay valid until sv3p_close. Their sizes must
- * be powers of two, 16..32768. The rx size is the window granted to Linux.
+ * be 16..32767. The rx buffer holds rxsize - 1 bytes, which is the window
+ * granted to Linux.
  * rows/cols: terminal size for WINSZ (0 = do not send).
  * Returns 0, or -1 for a bad port or size. The OPEN is sent by sv3p_poll. */
 int sv3p_open(struct sv3p *s, unsigned short port,

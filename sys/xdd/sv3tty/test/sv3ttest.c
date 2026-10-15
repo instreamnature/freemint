@@ -490,6 +490,36 @@ static void show_byte(unsigned char b)
 }
 
 
+/// @brief		Is the sv3tty TOS driver (TSR) installed? It uses the same
+///				mailbox, so this program must not run at the same time.
+///				Called through Supexec, since the cookie jar is only
+///				readable in supervisor mode.
+/// @return		1 if the driver's 'SV3T' cookie exists
+static long driver_installed(void)
+{
+	long *c = *(long **)0x5a0L;
+
+	if (!c)
+		return 0;
+	for (; c[0]; c += 2)
+	{
+		if (c[0] == 0x53563354L)		/* 'SV3T' */
+			return 1;
+	}
+	return 0;
+}
+
+
+/// @brief		Wait for a key, so the text can be read before the program ends
+///				when it was started from the desktop
+static void wait_key(void)
+{
+	fflush(stdout);
+	(void)Cconws("Press a key\r\n");
+	(void)Bconin(2);
+}
+
+
 /// @brief		sv3p_start in supervisor mode, called through Supexec
 /// @return		0
 static long super_start(void)
@@ -683,6 +713,14 @@ int main(int argc, char *argv[])
 	if (port >= NPORTS)
 	{
 		printf("Port must be 0..%d\n", NPORTS - 1);
+		wait_key();
+		return 1;
+	}
+	if (Supexec(driver_installed))
+	{
+		printf("sv3ttest: the sv3tty driver is installed and uses the mailbox.\n"
+			   "Use a terminal program on its ports instead, or boot without it.\n");
+		wait_key();
 		return 1;
 	}
 
@@ -749,5 +787,6 @@ int main(int argc, char *argv[])
 	theme_apply(1);
 
 	printf("\nsv3ttest: closed\n");
+	wait_key();
 	return 0;
 }

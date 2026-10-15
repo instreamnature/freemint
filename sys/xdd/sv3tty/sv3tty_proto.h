@@ -125,6 +125,17 @@ struct sv3p
 	unsigned long	resync_time;	/* _hz_200 when our last RESYNC was sent */
 	unsigned long	resync_interval;
 
+	/* Max messages handled per sv3p_poll: headers read, and DATA messages
+	 * sent. Keeps the time in a timer interrupt short; the rest is done
+	 * at the next poll. Set by sv3p_init, may be changed by the caller. */
+	unsigned short	rx_budget;
+	unsigned short	tx_budget;
+	unsigned short	tx_left;		/* DATA messages left in this poll */
+
+	/* Payload buffer. It is here and not on the stack, because the code
+	 * may run in an interrupt on a small supervisor stack. */
+	unsigned char	scratch[SV3P_MAX_PAYLOAD];
+
 	/* Statistics */
 	unsigned long	rx_msgs;
 	unsigned long	tx_msgs;

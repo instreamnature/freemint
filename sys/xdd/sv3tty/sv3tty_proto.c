@@ -34,8 +34,9 @@
 /* Max data words thrown away while looking for the marker at resync */
 #define SV3P_MARKER_MAX_SKIP	4096
 
-/* Max headers handled in one sv3p_poll */
-#define SV3P_RX_BUDGET			256
+/* Default for the max headers read and DATA messages sent in one sv3p_poll
+ * (s->rx_budget, s->tx_budget) */
+#define SV3P_BUDGET				256
 
 /* Time before our RESYNC is repeated when Linux does not answer */
 #define SV3P_RESYNC_FIRST		200		/* 1 s */
@@ -358,7 +359,7 @@ static void rx_resync(struct sv3p *s, unsigned char type, unsigned short arg)
 /// @param len	Payload length in bytes
 static void rx_data(struct sv3p *s, struct sv3p_port *p, unsigned short len)
 {
-	unsigned char buf[SV3P_MAX_PAYLOAD];
+	unsigned char *buf = s->scratch;
 	unsigned long i, w, n;
 
 	if (len == 0 || len > SV3P_MAX_PAYLOAD)
@@ -486,7 +487,7 @@ static void rx_all(struct sv3p *s)
 {
 	int n;
 
-	for (n = 0; n < SV3P_RX_BUDGET; n++)
+	for (n = 0; n < s->rx_budget; n++)
 	{
 		if (s->mb->stat_ctrl & SV3P_RX_LFIFO_EMPTY)
 			break;
@@ -508,7 +509,7 @@ static void rx_all(struct sv3p *s)
 static int tx_port(struct sv3p *s, unsigned short i)
 {
 	struct sv3p_port *p = &s->ports[i];
-	unsigned char buf[SV3P_MAX_PAYLOAD];
+	unsigned char *buf = s->scratch;
 	unsigned long n;
 
 	// The program has closed the port: tell Linux (hangs up the tty)
@@ -557,9 +558,12 @@ static int tx_port(struct sv3p *s, unsigned short i)
 		p->credit_owed = 0;
 	}
 
-	// Data, as much as the credit allows, in messages of at most 256 bytes
-	while (p->credited && p->tx_credit && ring_count(SV3P_TX(p)))
+	// Data, as much as the credit and the budget of this poll allow, in
+	// messages of at most 256 bytes. Control messages above are always
+	// sent, they are few and some must go together (OPEN + CREDIT).
+	while (s->tx_left && p->credited && p->tx_credit && ring_count(SV3P_TX(p)))
 	{
+		s->tx_left--;
 		n = SV3P_MAX_PAYLOAD;
 		if (p->tx_credit < n)
 			n = p->tx_credit;
@@ -610,6 +614,7 @@ static void tx_all(struct sv3p *s)
 	}
 
 	// All ports, round robin, so no port can starve the others
+	s->tx_left = s->tx_budget;
 	for (n = 0; n < s->nports; n++)
 	{
 		unsigned short i = (s->tx_next + n) % s->nports;
@@ -653,6 +658,8 @@ void sv3p_init(struct sv3p *s, struct sv3p_port *ports, unsigned short nports)
 	s->ports           = ports;
 	s->nports          = nports;
 	s->resync_interval = SV3P_RESYNC_FIRST;
+	s->rx_budget       = SV3P_BUDGET;
+	s->tx_budget       = SV3P_BUDGET;
 }
 
 

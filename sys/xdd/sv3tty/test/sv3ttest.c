@@ -57,6 +57,7 @@
 #include <mint/falcon.h>
 
 #include "../sv3tty_proto.h"
+#include "../tos/sv3tty_tos.h"
 
 
 #define NPORTS				16
@@ -77,6 +78,32 @@
 
 static struct sv3p			proto;
 static struct sv3p_port		ports[NPORTS];
+
+/* The protocol state shown by HELP: our own, or the driver's in -b mode */
+static struct sv3p			*ps = &proto;
+
+/* -b mode: BIOS device of the port (through the sv3tty driver), else -1 */
+static long					bios_dev = -1;
+
+
+/// @brief		Send bytes to the port: through the BIOS in -b mode (Bconout
+///				waits while the driver's buffer is full), else into our own
+///				protocol buffer
+/// @param port	Port number
+/// @param buf	Bytes
+/// @param n	Number of bytes
+static void port_write(unsigned short port, const unsigned char *buf, long n)
+{
+	long i;
+
+	if (bios_dev >= 0)
+	{
+		for (i = 0; i < n; i++)
+			Bconout((short)bios_dev, buf[i]);
+	}
+	else
+		sv3p_write(&proto, port, buf, n);
+}
 static unsigned char		rxbuf[RXSIZE];
 static unsigned char		txbuf[TXSIZE];
 
@@ -168,7 +195,7 @@ static void send_char(unsigned short port, unsigned char c)
 
 	if (!convert || c < 0x80)
 	{
-		sv3p_write(&proto, port, &c, 1);
+		port_write(port, &c, 1);
 		return;
 	}
 
@@ -177,14 +204,14 @@ static void send_char(unsigned short port, unsigned char c)
 	{
 		utf[0] = 0xC0 | (u >> 6);
 		utf[1] = 0x80 | (u & 0x3F);
-		sv3p_write(&proto, port, utf, 2);
+		port_write(port, utf, 2);
 	}
 	else
 	{
 		utf[0] = 0xE0 | (u >> 12);
 		utf[1] = 0x80 | ((u >> 6) & 0x3F);
 		utf[2] = 0x80 | (u & 0x3F);
-		sv3p_write(&proto, port, utf, 3);
+		port_write(port, utf, 3);
 	}
 }
 
@@ -491,21 +518,16 @@ static void show_byte(unsigned char b)
 
 
 /// @brief		Is the sv3tty TOS driver (TSR) installed? It uses the same
-///				mailbox, so this program must not run at the same time.
-///				Called through Supexec, since the cookie jar is only
-///				readable in supervisor mode.
-/// @return		1 if the driver's 'SV3T' cookie exists
-static long driver_installed(void)
+///				mailbox, so without -b this program must not run at the
+///				same time. Called through Supexec, since the cookie jar is
+///				only readable in supervisor mode.
+/// @return		The driver's struct sv3t_info, or 0 if it is not installed
+static long find_driver(void)
 {
-	long *c = *(long **)0x5a0L;
+	long value;
 
-	if (!c)
-		return 0;
-	for (; c[0]; c += 2)
-	{
-		if (c[0] == 0x53563354L)		/* 'SV3T' */
-			return 1;
-	}
+	if (sv3t_get_cookie(SV3T_COOKIE, &value))
+		return value;
 	return 0;
 }
 
@@ -591,31 +613,32 @@ static void stats_line(unsigned short port, const char *line)
 /// @param port	Our port
 static void show_stats(unsigned short port)
 {
-	struct sv3p_port *p = &ports[port];
+	struct sv3p_port *p = &ps->ports[port];
 	char *la = linea_base();
 	char line[100];
 
-	sprintf(line, "\r\n[sv3ttest] link %s (peer v%u), port %u\r\n",
-			proto.link_up ? "UP" : "WAIT", proto.peer_version, port);
+	sprintf(line, "\r\n[sv3ttest] link %s (peer v%u), port %u%s\r\n",
+			ps->link_up ? "UP" : "WAIT", ps->peer_version, port,
+			bios_dev >= 0 ? " (through the driver)" : "");
 	stats_line(port, line);
 	sprintf(line, "  port:   announced %u credited %u carrier %u tx_credit %lu credit_owed %lu\r\n",
 			p->announced, p->credited, p->carrier, p->tx_credit, p->credit_owed);
 	stats_line(port, line);
 	sprintf(line, "  buffer: rx_buf %ld tx_buf %ld rx_total %lu (rx head %d tail %d)\r\n",
-			sv3p_rx_count(&proto, port), (long)(TXSIZE - 1) - sv3p_tx_room(&proto, port),
+			sv3p_rx_count(ps, port), (long)(SV3P_TX(p)->buflen - 1) - sv3p_tx_room(ps, port),
 			p->rx_total, SV3P_RX(p)->head, SV3P_RX(p)->tail);
 	stats_line(port, line);
 	sprintf(line, "  rx:     msgs %lu bytes %lu dropped %lu\r\n",
-			proto.rx_msgs, proto.rx_bytes, proto.rx_dropped);
+			ps->rx_msgs, ps->rx_bytes, ps->rx_dropped);
 	stats_line(port, line);
 	sprintf(line, "  rx err: bad_hdr %lu timeouts %lu unknown %lu\r\n",
-			proto.rx_bad_hdr, proto.rx_timeouts, proto.rx_unknown);
+			ps->rx_bad_hdr, ps->rx_timeouts, ps->rx_unknown);
 	stats_line(port, line);
 	sprintf(line, "  tx:     msgs %lu bytes %lu timeouts %lu\r\n",
-			proto.tx_msgs, proto.tx_bytes, proto.tx_timeouts);
+			ps->tx_msgs, ps->tx_bytes, ps->tx_timeouts);
 	stats_line(port, line);
 	sprintf(line, "  link:   resyncs %lu skipped_words %lu\r\n",
-			proto.resyncs, proto.skipped_words);
+			ps->resyncs, ps->skipped_words);
 	stats_line(port, line);
 
 	// What TOS believes about the screen (to understand the VT52 problems)
@@ -678,7 +701,7 @@ static int handle_key(unsigned short port, long key)
 	case SCAN_BACKSPACE:
 		// Linux uses DEL as erase character by default
 		seq[0] = 0x7F;
-		sv3p_write(&proto, port, seq, 1);
+		port_write(port, seq, 1);
 		return 0;
 
 	case SCAN_UP:		seq[1] = 'A'; break;
@@ -694,7 +717,7 @@ static int handle_key(unsigned short port, long key)
 
 	// Arrow key: VT52 sequence ESC A..D
 	seq[0] = 0x1B;
-	sv3p_write(&proto, port, seq, 2);
+	port_write(port, seq, 2);
 	return 0;
 }
 
@@ -705,23 +728,45 @@ int main(int argc, char *argv[])
 	unsigned char rows, cols;
 	unsigned char last_link = 0xFF, last_carrier = 0xFF;
 	unsigned char buf[256];
+	struct sv3t_info *info;
+	int argi = 1;
 	long n;
 	int quit = 0;
 
-	if (argc > 1)
-		port = (unsigned short)atoi(argv[1]);
+	// -b: use the port through the sv3tty driver's BIOS device
+	if (argc > argi && argv[argi][0] == '-' && argv[argi][1] == 'b')
+	{
+		bios_dev = 0;
+		argi++;
+	}
+	if (argc > argi)
+		port = (unsigned short)atoi(argv[argi]);
 	if (port >= NPORTS)
 	{
 		printf("Port must be 0..%d\n", NPORTS - 1);
 		wait_key();
 		return 1;
 	}
-	if (Supexec(driver_installed))
+
+	info = (struct sv3t_info *)Supexec(find_driver);
+	if (bios_dev < 0 && info)
 	{
 		printf("sv3ttest: the sv3tty driver is installed and uses the mailbox.\n"
-			   "Use a terminal program on its ports instead, or boot without it.\n");
+			   "Use sv3ttest -b [port] to go through the driver instead.\n");
 		wait_key();
 		return 1;
+	}
+	if (bios_dev >= 0)
+	{
+		if (!info || info->version != SV3T_INFO_VERSION || port >= info->nports)
+		{
+			printf("sv3ttest -b: the sv3tty driver (version %d, %d ports) is not installed\n",
+				   SV3T_INFO_VERSION, NPORTS);
+			wait_key();
+			return 1;
+		}
+		bios_dev = info->first_dev + port;
+		ps       = info->proto;
 	}
 
 	screen_size(&rows, &cols);
@@ -729,42 +774,62 @@ int main(int argc, char *argv[])
 	// Theme colours and a cleared screen before anything is written
 	theme_apply(1);
 
-	printf("sv3ttest: terminal on sv3tty port %u (/dev/ttySV%u), screen %ux%u\n",
-		   port, port, cols, rows);
+	if (bios_dev >= 0)
+		printf("sv3ttest: terminal on BIOS device %ld = sv3tty port %u (/dev/ttySV%u)\n",
+			   bios_dev, port, port);
+	else
+		printf("sv3ttest: terminal on sv3tty port %u (/dev/ttySV%u), screen %ux%u\n",
+			   port, port, cols, rows);
 	printf("UNDO quit, HELP statistics, F7 ESC K fix, F8 dark/light, F9 debug, F10 charset\n");
 	fflush(stdout);
 
-	// The program runs in user mode. The mailbox and _hz_200 can only be
-	// reached in supervisor mode, so sv3p_start and sv3p_poll are called
-	// through Supexec, which runs them on the system's supervisor stack.
-	sv3p_init(&proto, ports, NPORTS);
-	sv3p_open(&proto, port, rxbuf, RXSIZE, txbuf, TXSIZE, rows, cols);
-	Supexec(super_start);
+	// Without -b the program does the protocol itself. It runs in user mode;
+	// the mailbox and _hz_200 can only be reached in supervisor mode, so
+	// sv3p_start and sv3p_poll are called through Supexec, which runs them
+	// on the system's supervisor stack.
+	// With -b the driver does all that; the first Bconstat opens the port.
+	if (bios_dev < 0)
+	{
+		sv3p_init(&proto, ports, NPORTS);
+		sv3p_open(&proto, port, rxbuf, RXSIZE, txbuf, TXSIZE, rows, cols);
+		Supexec(super_start);
+	}
+	else
+		(void)Bconstat((short)bios_dev);
 
 	while (!quit)
 	{
-		Supexec(super_poll);
+		if (bios_dev < 0)
+			Supexec(super_poll);
 
 		// Report changes of the link state and of carrier
-		if (proto.link_up != last_link)
+		if (ps->link_up != last_link)
 		{
-			last_link = proto.link_up;
+			last_link = ps->link_up;
 			con_puts(last_link ? "\r\n[sv3ttest] link up\r\n" : "\r\n[sv3ttest] waiting for link...\r\n");
 		}
-		if (ports[port].carrier != last_carrier)
+		if (ps->ports[port].carrier != last_carrier)
 		{
-			last_carrier = ports[port].carrier;
-			if (proto.link_up)
+			last_carrier = ps->ports[port].carrier;
+			if (ps->link_up)
 				con_puts(last_carrier ? "[sv3ttest] carrier up\r\n" : "[sv3ttest] carrier down\r\n");
 		}
-		if (ports[port].got_break)
+		if (ps->ports[port].got_break)
 		{
-			ports[port].got_break = 0;
+			ps->ports[port].got_break = 0;
 			con_puts("[sv3ttest] break\r\n");
 		}
 
 		// Data from Linux to the screen (VT52 emulation of TOS)
-		n = sv3p_read(&proto, port, buf, sizeof(buf));
+		if (bios_dev >= 0)
+		{
+			// Through the driver: Bconin for each character waiting
+			n = 0;
+			while (n < (long)sizeof(buf) && Bconstat((short)bios_dev))
+				buf[n++] = (unsigned char)Bconin((short)bios_dev);
+		}
+		else
+			n = sv3p_read(&proto, port, buf, sizeof(buf));
 		if (n > 0)
 		{
 			long i;
@@ -778,9 +843,13 @@ int main(int argc, char *argv[])
 			quit = handle_key(port, Bconin(2));
 	}
 
-	// Send CLOSE and let it go out
-	sv3p_close(&proto, port);
-	Supexec(super_poll);
+	// Without -b: send CLOSE and let it go out. With -b the port stays open
+	// in the driver (closing comes in the next step of the driver).
+	if (bios_dev < 0)
+	{
+		sv3p_close(&proto, port);
+		Supexec(super_poll);
+	}
 
 	// Back to the normal TOS colours (black on white) for the desktop
 	dark = 0;

@@ -12,7 +12,7 @@
 
 #define SV3T_COOKIE			0x53563354L		/* 'SV3T': our cookie and XBRA id */
 #define SUPV_COOKIE			0x53757056L		/* 'SupV': installed by sv_xbios.prg */
-#define SV3T_INFO_VERSION	1
+#define SV3T_INFO_VERSION	2
 
 /* SuperVidel firmware version register. 300..399 is a SuperVidel 3, which
  * has the mailboxes. Only read it when the SupV cookie exists. */
@@ -28,6 +28,8 @@ struct sv3t_info
 	unsigned short	tick_budget;	/* Messages per timer tick, each way */
 	struct sv3p		*proto;			/* Protocol state, see sv3tty_proto.h */
 	volatile unsigned long ticks;	/* Timer ticks handled */
+	unsigned short	first_dev;		/* BIOS device number of port 0 */
+	unsigned short	old_maptab;		/* Bconmap rows before ours */
 };
 
 /* Cookie jar access, supervisor mode only */

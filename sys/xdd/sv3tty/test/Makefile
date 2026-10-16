@@ -8,8 +8,8 @@ CFLAGS  = -m68020-60 -O2 -Wall -fomit-frame-pointer
 LDFLAGS = -s
 
 TARGET  = sv3ttest.tos
-SRCS    = sv3ttest.c ../sv3tty_proto.c
-HDRS    = ../sv3tty_proto.h
+SRCS    = sv3ttest.c ../sv3tty_proto.c ../tos/cookie.c
+HDRS    = ../sv3tty_proto.h ../tos/sv3tty_tos.h
 
 all: $(TARGET)
 

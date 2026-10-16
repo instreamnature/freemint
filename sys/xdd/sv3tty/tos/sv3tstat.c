@@ -97,6 +97,8 @@ int main(void)
 
 	printf("sv3tty driver: %u ports, SuperVidel firmware %u, budget %u/tick\n",
 		   info->nports, info->sv_firmware, info->tick_budget);
+	printf("  BIOS devices %u..%u (Bconmap had %u rows before)\n",
+		   info->first_dev, info->first_dev + info->nports - 1, info->old_maptab);
 	printf("  link %s (peer v%u), ticks %lu, resyncs %lu, skipped_words %lu\n",
 		   s->link_up ? "UP" : "WAIT", s->peer_version, info->ticks,
 		   s->resyncs, s->skipped_words);

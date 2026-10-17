@@ -37,6 +37,8 @@
  *
  * Keys:
  *   UNDO       quit (sends CLOSE, so Linux hangs up the session)
+ *   Shift+UNDO quit, but keep the port open in the driver (-b mode), so the
+ *              session can be continued by starting the program again
  *   HELP       show link state, statistics and what TOS reports about the screen
  *   F7         erase to end of line (ESC K) with spaces / by TOS, see erase_eol()
  *   F8         dark/light theme (clears the screen)
@@ -84,6 +86,20 @@ static struct sv3p			*ps = &proto;
 
 /* -b mode: BIOS device of the port (through the sv3tty driver), else -1 */
 static long					bios_dev = -1;
+
+/* -b mode: the driver (from its cookie) and our port, for closing it */
+static struct sv3t_info		*drv;
+static long					drv_port;
+
+
+/// @brief		Close our port in the driver (CLOSE to Linux, which hangs up
+///				the session). Called through Supexec, since the driver's
+///				close_port needs supervisor mode.
+/// @return		0, or -1 for a bad port
+static long super_close_drv(void)
+{
+	return drv->close_port(drv_port);
+}
 
 
 /// @brief		Send bytes to the port: through the BIOS in -b mode (Bconout
@@ -657,7 +673,8 @@ static void show_stats(unsigned short port)
 /// @brief		Send one key to the port
 /// @param port	Our port
 /// @param key	Bconin(2) value: scan code in bits 16..23, ASCII in bits 0..7
-/// @return		0 to continue, 1 to quit
+/// @return		0 to continue, 1 to quit and hang up the port, 2 to quit and
+///				keep the port open (Shift+UNDO, -b mode)
 static int handle_key(unsigned short port, long key)
 {
 	unsigned char scan  = (unsigned char)(key >> 16);
@@ -667,7 +684,8 @@ static int handle_key(unsigned short port, long key)
 	switch (scan)
 	{
 	case SCAN_UNDO:
-		return 1;
+		// Shift (bits 0, 1 of Kbshift) + UNDO: leave the session running
+		return (Kbshift(-1) & 3) ? 2 : 1;
 
 	case SCAN_HELP:
 		show_stats(port);
@@ -767,6 +785,8 @@ int main(int argc, char *argv[])
 		}
 		bios_dev = info->first_dev + port;
 		ps       = info->proto;
+		drv      = info;
+		drv_port = port;
 	}
 
 	screen_size(&rows, &cols);
@@ -781,6 +801,8 @@ int main(int argc, char *argv[])
 		printf("sv3ttest: terminal on sv3tty port %u (/dev/ttySV%u), screen %ux%u\n",
 			   port, port, cols, rows);
 	printf("UNDO quit, HELP statistics, F7 ESC K fix, F8 dark/light, F9 debug, F10 charset\n");
+	if (bios_dev >= 0)
+		printf("Shift+UNDO quit and keep the session open\n");
 	fflush(stdout);
 
 	// Without -b the program does the protocol itself. It runs in user mode;
@@ -843,13 +865,16 @@ int main(int argc, char *argv[])
 			quit = handle_key(port, Bconin(2));
 	}
 
-	// Without -b: send CLOSE and let it go out. With -b the port stays open
-	// in the driver (closing comes in the next step of the driver).
+	// Without -b: send CLOSE and let it go out.
+	// With -b: UNDO closes the port in the driver (Linux hangs up the
+	// session), Shift+UNDO leaves it open, so the session can be continued.
 	if (bios_dev < 0)
 	{
 		sv3p_close(&proto, port);
 		Supexec(super_poll);
 	}
+	else if (quit == 1)
+		Supexec(super_close_drv);
 
 	// Back to the normal TOS colours (black on white) for the desktop
 	dark = 0;

@@ -12,7 +12,8 @@
 
 #define SV3T_COOKIE			0x53563354L		/* 'SV3T': our cookie and XBRA id */
 #define SUPV_COOKIE			0x53757056L		/* 'SupV': installed by sv_xbios.prg */
-#define SV3T_INFO_VERSION	2
+#define SV3T_INFO_VERSION	3
+#define RSVF_COOKIE			0x52535646L		/* 'RSVF': port list for terminal programs */
 
 /* SuperVidel firmware version register. 300..399 is a SuperVidel 3, which
  * has the mailboxes. Only read it when the SupV cookie exists. */
@@ -30,6 +31,14 @@ struct sv3t_info
 	volatile unsigned long ticks;	/* Timer ticks handled */
 	unsigned short	first_dev;		/* BIOS device number of port 0 */
 	unsigned short	old_maptab;		/* Bconmap rows before ours */
+
+	/* Close a port: CLOSE to Linux, which hangs up the session there. The
+	 * next BIOS access opens the port again. Supervisor mode only (it
+	 * turns interrupts off for a moment). Returns 0, or -1 for a bad port. */
+	long			(*close_port)(long port);
+
+	unsigned char	rsvf_ok;		/* Ports are in the RSVF list */
+	unsigned char	res[3];
 };
 
 /* Cookie jar access, supervisor mode only */

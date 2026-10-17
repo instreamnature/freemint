@@ -10,13 +10,19 @@ LDFLAGS = -s
 
 PROTO   = ../sv3tty_proto.c ../sv3tty_proto.h
 
-all: sv3tty.prg sv3tstat.tos
+all: sv3tty.prg sv3tstat.tos sv3tclos.ttp sv3taux.ttp
 
 sv3tty.prg: sv3tty_tos.c timerc.S bios.S cookie.c sv3tty_tos.h $(PROTO)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ sv3tty_tos.c timerc.S bios.S cookie.c ../sv3tty_proto.c
 
 sv3tstat.tos: sv3tstat.c cookie.c sv3tty_tos.h ../sv3tty_proto.h
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ sv3tstat.c cookie.c
+
+sv3tclos.ttp: sv3tclos.c cookie.c sv3tty_tos.h ../sv3tty_proto.h
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ sv3tclos.c cookie.c
+
+sv3taux.ttp: sv3taux.c cookie.c sv3tty_tos.h ../sv3tty_proto.h
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ sv3taux.c cookie.c
 
 # Check that the code called from the interrupt uses no FPU instructions
 fpucheck:
@@ -25,6 +31,6 @@ fpucheck:
 	rm -f sv3tty.sym
 
 clean:
-	rm -f sv3tty.prg sv3tstat.tos sv3tty.sym
+	rm -f sv3tty.prg sv3tstat.tos sv3tclos.ttp sv3taux.ttp sv3tty.sym
 
 .PHONY: all clean fpucheck

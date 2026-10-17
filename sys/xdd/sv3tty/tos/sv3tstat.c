@@ -17,6 +17,54 @@ static long cookie_value;
 
 #define MEASURE_SECONDS		5
 
+static long rsvf_value;
+
+
+/// @brief		Look for the RSVF cookie, called through Supexec
+/// @return		1 if found
+static long find_rsvf(void)
+{
+	return sv3t_get_cookie(RSVF_COOKIE, &rsvf_value);
+}
+
+
+/// @brief		Show all serial ports in the RSVF list, as terminal programs
+///				see them. An entry with bit 7 of its type set is a port, any
+///				other entry is a link to the next list (0 = end).
+static void show_rsvf(void)
+{
+	struct entry
+	{
+		char			*data;
+		unsigned char	type, res1, bdev, res2;
+	} *e;
+	int n = 0;
+
+	if (!Supexec(find_rsvf))
+	{
+		printf("  RSVF: no cookie\n");
+		return;
+	}
+
+	printf("  RSVF ports (BIOS device):");
+	e = (struct entry *)rsvf_value;
+	while (e && n < 64)
+	{
+		if (e->type & 0x80)
+		{
+			// Five per line, the TOS console does not wrap lines
+			if (n % 5 == 0)
+				printf("\n   ");
+			printf(" %s(%u)", e->data, e->bdev);
+			e++;
+			n++;
+		}
+		else
+			e = (struct entry *)e->data;	// Link to the next list, or end
+	}
+	printf("\n");
+}
+
 
 /// @brief		Read _hz_200 (TOS' 200 Hz counter), called through Supexec
 /// @return		Counter value
@@ -99,6 +147,7 @@ int main(void)
 		   info->nports, info->sv_firmware, info->tick_budget);
 	printf("  BIOS devices %u..%u (Bconmap had %u rows before)\n",
 		   info->first_dev, info->first_dev + info->nports - 1, info->old_maptab);
+	show_rsvf();
 	printf("  link %s (peer v%u), ticks %lu, resyncs %lu, skipped_words %lu\n",
 		   s->link_up ? "UP" : "WAIT", s->peer_version, info->ticks,
 		   s->resyncs, s->skipped_words);
@@ -115,7 +164,7 @@ int main(void)
 
 		if (!p->open && !p->announced)
 			continue;
-		printf("  port %u: open %u announced %u credited %u carrier %u tx_credit %lu rx_total %lu\n",
+		printf("  port %u: open %u ann %u cred %u carrier %u tx_credit %lu rx %lu\n",
 			   i, p->open, p->announced, p->credited, p->carrier, p->tx_credit, p->rx_total);
 	}
 

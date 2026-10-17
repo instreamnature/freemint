@@ -5,10 +5,11 @@
  * ports to PetaLinux on SuperVidel 3 over mailbox channel 1, see
  * PROTOCOL.md and sv3tty_proto.c.
  *
- * Step 3 of the driver: the ports are BIOS devices. They are added to the
- * end of the Bconmap table, so on a Falcon (devices 6..8 = MFP, SCC B,
- * SCC A) port 0 is BIOS device 9. Programs use them with Bconin, Bconout,
- * Bconstat, Bcostat and Iorec, or as AUX: after Bconmap(dev).
+ * The ports are BIOS devices. They are added to the end of the Bconmap
+ * table, so on a Falcon (devices 6..8 = MFP, SCC B, SCC A) port 0 is BIOS
+ * device 9. Programs use them with Bconin, Bconout, Bconstat, Bcostat and
+ * Iorec, or as AUX: after Bconmap(dev). Their names SV3TTY0..SV3TTY15 are
+ * in the RSVF list, where terminal programs look for serial ports.
  *
  * Install:
  *  - Needs the SupV cookie from sv_xbios.prg (so it must come after
@@ -17,6 +18,8 @@
  *    (sv3tstat.tos) use it, and it keeps the driver from being installed
  *    twice. sv3ttest.tos only runs with the driver in its -b mode.
  *  - Extends the Bconmap table with one row per port.
+ *  - Puts the port names in the RSVF list (cookie 'RSVF'), linked to an
+ *    existing list if there is one.
  *  - Hooks Timer C (vector 0x114, XBRA id 'SV3T') and stays resident.
  *
  * Interrupt:
@@ -29,8 +32,10 @@
  *
  * BIOS functions (called through bios.S, in the context of the calling
  * program):
- *  - The first call for a port opens it (OPEN to Linux). There is no close
- *    in the BIOS; that comes in the next step.
+ *  - The first call for a port opens it (OPEN to Linux). The BIOS has no
+ *    close; info.close_port (used by sv3tclos.ttp and sv3ttest) closes a
+ *    port, which hangs up the Linux session. The next access opens it
+ *    again with a fresh login.
  *  - Bconout waits while the transmit buffer is full. When the link to
  *    Linux is down, characters are thrown away, so a program does not hang
  *    when Linux is not running.
@@ -76,6 +81,21 @@ typedef struct
 	short			maptabsize;	/* Rows; row 0 is BIOS device 6 */
 } BCONMAP;
 
+/* One entry of the RSVF list (HSMODEM convention, see FreeMiNT's
+ * sys/mint/rsvf.h): terminal programs find the serial ports and their
+ * names here. An entry without RSVF_PORT is a link: data points to the
+ * next list, or is 0 at the end. */
+struct rsvf
+{
+	char			*data;		/* Port name, or link to the next list */
+	unsigned char	type;
+	unsigned char	res1;
+	unsigned char	bdev;		/* BIOS device number */
+	unsigned char	res2;
+};
+#define RSVF_PORT			0x80	/* Entry is a port */
+#define RSVF_BIOS			0x20	/* The port is a BIOS device */
+
 /* mintlib: memory used by the program, for Ptermres */
 extern long _PgmSize;
 
@@ -97,6 +117,8 @@ static struct sv3t_info		info;
 static unsigned short		sv_firmware;
 static unsigned short		first_dev;		/* BIOS device number of port 0 */
 static MAPTAB				new_maptab[MAX_OLD_MAPTAB + NPORTS];
+static struct rsvf			rsvf_list[NPORTS + 1];		/* Our ports, then a link */
+static char					port_names[NPORTS][10];		/* "SV3TTY0".."SV3TTY15" */
 
 
 
@@ -238,9 +260,99 @@ long sv3t_bconout(long dev, long c)
 
 
 
+/// @brief		Close a port: the timer interrupt sends CLOSE to Linux, which
+///				hangs up the session on the tty. The next BIOS access opens
+///				the port again (and Linux starts a fresh getty). Reached
+///				through info.close_port; supervisor mode only.
+/// @param port	Port number
+/// @return		0, or -1 for a bad port
+static long close_port(long port)
+{
+	unsigned short sr;
+
+	if ((unsigned long)port >= NPORTS)
+		return -1;
+	sr = ipl7();
+	sv3p_close(&proto, (unsigned short)port);
+	ipl_restore(sr);
+	return 0;
+}
+
+
+
 /* ================================================================== */
 /* Installation                                                       */
 /* ================================================================== */
+
+static int add_cookie(long id, long value);
+
+
+/// @brief			Change the value of an existing cookie. Supervisor mode.
+/// @param id		Cookie id
+/// @param value	New value
+/// @return			1 if the cookie was found, 0 otherwise
+static int set_cookie_value(long id, long value)
+{
+	long *c = *(long **)0x5a0L;
+
+	if (!c)
+		return 0;
+	for (; c[0]; c += 2)
+	{
+		if (c[0] == id)
+		{
+			c[1] = value;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+
+/// @brief		Put our ports in the RSVF list, so terminal programs find
+///				them by name. If an RSVF cookie exists (e.g. from HSMODEM),
+///				our list ends with a link to the old list and the cookie
+///				points to ours; otherwise our list ends there and the cookie
+///				is added. Supervisor mode, interrupts off.
+/// @return		1 on success, 0 if the cookie jar is full
+static int install_rsvf(void)
+{
+	long old = 0;
+	int i;
+
+	for (i = 0; i < NPORTS; i++)
+	{
+		char *n = port_names[i];
+
+		n[0] = 'S'; n[1] = 'V'; n[2] = '3'; n[3] = 'T'; n[4] = 'T'; n[5] = 'Y';
+		if (i < 10)
+		{
+			n[6] = '0' + i;
+			n[7] = 0;
+		}
+		else
+		{
+			n[6] = '0' + i / 10;
+			n[7] = '0' + i % 10;
+			n[8] = 0;
+		}
+
+		rsvf_list[i].data = n;
+		rsvf_list[i].type = RSVF_PORT | RSVF_BIOS;
+		rsvf_list[i].res1 = 0;
+		rsvf_list[i].bdev = (unsigned char)(first_dev + i);
+		rsvf_list[i].res2 = 0;
+	}
+
+	// Last entry: a link to the old list, or the end of the list
+	sv3t_get_cookie(RSVF_COOKIE, &old);
+	rsvf_list[NPORTS].data = (char *)old;
+	rsvf_list[NPORTS].type = 0;
+
+	if (old)
+		return set_cookie_value(RSVF_COOKIE, (long)rsvf_list);
+	return add_cookie(RSVF_COOKIE, (long)rsvf_list);
+}
 
 /// @brief			Add a cookie to the cookie jar. Supervisor mode, with
 ///					interrupts off.
@@ -370,6 +482,7 @@ static long install(void)
 	info.tick_budget = TICK_BUDGET;
 	info.proto       = &proto;
 	info.ticks       = 0;
+	info.close_port  = close_port;
 
 	// The ports as BIOS devices. Before the cookie, so a failure leaves
 	// nothing behind.
@@ -382,6 +495,12 @@ static long install(void)
 	ipl_restore(sr);
 	if (!ok)
 		return ERR_COOKIE_JAR;
+
+	// Port names for terminal programs. Without it (full cookie jar) the
+	// ports still work through their BIOS device numbers.
+	sr = ipl7();
+	info.rsvf_ok = (unsigned char)install_rsvf();
+	ipl_restore(sr);
 
 	// Start the resync before the timer is hooked, so nothing runs twice
 	sv3p_start(&proto);
@@ -402,7 +521,7 @@ int main(void)
 	long r;
 	char line[100];
 
-	(void)Cconws("SV3TTY driver for TOS (step 3: BIOS devices)\r\n");
+	(void)Cconws("SV3TTY driver for TOS\r\n");
 
 	r = Supexec(install);
 	switch (r)
@@ -439,6 +558,10 @@ int main(void)
 	sprintf(line, "sv3tty: SuperVidel firmware %u, %d ports = BIOS devices %u..%u\r\n",
 			sv_firmware, NPORTS, first_dev, first_dev + NPORTS - 1);
 	(void)Cconws(line);
+	if (info.rsvf_ok)
+		(void)Cconws("sv3tty: port names SV3TTY0..SV3TTY15 in the RSVF list\r\n");
+	else
+		(void)Cconws("sv3tty: cookie jar full, port names not in the RSVF list\r\n");
 	(void)Cconws("sv3tty: Timer C hooked, waiting for link\r\n");
 
 	// Time to read the messages when started from the desktop. The timer

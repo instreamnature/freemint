@@ -52,7 +52,7 @@ static void close_one(struct sv3t_info *info, long port)
 		printf("sv3tclos: no port %ld (0..%u)\n", port, info->nports - 1);
 	else
 		printf("sv3tclos: port %ld (BIOS device %ld, SV3TTY%ld) closed\n",
-			   port, info->first_dev + port, port);
+			   port, (long)info->bdev[port], port);
 }
 
 

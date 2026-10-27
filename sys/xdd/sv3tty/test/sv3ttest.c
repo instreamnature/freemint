@@ -783,7 +783,13 @@ int main(int argc, char *argv[])
 			wait_key();
 			return 1;
 		}
-		bios_dev = info->first_dev + port;
+		bios_dev = info->bdev[port];
+		if (!bios_dev)
+		{
+			printf("sv3ttest -b: port %u has no BIOS device (DRVIN's table is full)\n", port);
+			wait_key();
+			return 1;
+		}
 		ps       = info->proto;
 		drv      = info;
 		drv_port = port;

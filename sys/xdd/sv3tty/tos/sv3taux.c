@@ -62,7 +62,14 @@ int main(int argc, char *argv[])
 			sv3t_wait_key(0);
 			return 1;
 		}
-		dev = info->first_dev + port;
+		dev = info->bdev[port];
+		if (!dev)
+		{
+			printf("sv3taux: port %ld has no BIOS device (only U:\\DEV\\SV3TTY%ld)\n", port, port);
+			fflush(stdout);
+			sv3t_wait_key(0);
+			return 1;
+		}
 	}
 
 	// Bconmap(dev) maps AUX: to dev and returns the device it was before

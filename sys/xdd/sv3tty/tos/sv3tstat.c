@@ -46,16 +46,16 @@ static void show_rsvf(void)
 		return;
 	}
 
-	printf("  RSVF ports (BIOS device):");
+	printf("  RSVF ports (BIOS device, type):");
 	e = (struct entry *)rsvf_value;
 	while (e && n < 64)
 	{
 		if (e->type & 0x80)
 		{
-			// Five per line, the TOS console does not wrap lines
-			if (n % 5 == 0)
+			// Four per line, the TOS console does not wrap lines
+			if (n % 4 == 0)
 				printf("\n   ");
-			printf(" %s(%u)", e->data, e->bdev);
+			printf(" %s(%u,%02x)", e->data, e->bdev, e->type);
 			e++;
 			n++;
 		}
@@ -145,8 +145,12 @@ int main(void)
 
 	printf("sv3tty driver: %u ports, SuperVidel firmware %u, budget %u/tick\n",
 		   info->nports, info->sv_firmware, info->tick_budget);
-	printf("  BIOS devices %u..%u (Bconmap had %u rows before)\n",
-		   info->first_dev, info->first_dev + info->nports - 1, info->old_maptab);
+	if (info->drvin)
+		printf("  ports 0..%u = BIOS devices %u..%u from DRVIN, %u ports in U:\\DEV\\\n",
+			   info->nbios - 1, info->bdev[0], info->bdev[info->nbios - 1], info->gemdos_ports);
+	else
+		printf("  BIOS devices %u..%u (Bconmap had %u rows before)\n",
+			   info->bdev[0], info->bdev[info->nbios - 1], info->old_maptab);
 	show_rsvf();
 	printf("  link %s (peer v%u), ticks %lu, resyncs %lu, skipped_words %lu\n",
 		   s->link_up ? "UP" : "WAIT", s->peer_version, info->ticks,

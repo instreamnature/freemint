@@ -10,10 +10,15 @@ LDFLAGS = -s
 
 PROTO   = ../sv3tty_proto.c ../sv3tty_proto.h
 
-all: sv3tty.prg sv3tstat.tos sv3tclos.ttp sv3taux.ttp
+all: sv3tty.prg sv3ttydb.prg sv3tstat.tos sv3tclos.ttp sv3taux.ttp
 
-sv3tty.prg: sv3tty_tos.c timerc.S bios.S cookie.c sv3tty_tos.h $(PROTO)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ sv3tty_tos.c timerc.S bios.S cookie.c ../sv3tty_proto.c
+# Trace build: logs every BIOS and GEMDOS device call to port 15 (ttySV15)
+# and, once port 0 is opened, every GEMDOS, BIOS and XBIOS call (traps.S)
+sv3ttydb.prg: sv3tty_tos.c timerc.S traps.S bios.S ddev.S cookie.c sv3tty_tos.h $(PROTO)
+	$(CC) $(CFLAGS) -DSV3T_TRACE $(LDFLAGS) -o $@ sv3tty_tos.c timerc.S traps.S bios.S ddev.S cookie.c ../sv3tty_proto.c
+
+sv3tty.prg: sv3tty_tos.c timerc.S bios.S ddev.S cookie.c sv3tty_tos.h $(PROTO)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ sv3tty_tos.c timerc.S bios.S ddev.S cookie.c ../sv3tty_proto.c
 
 sv3tstat.tos: sv3tstat.c cookie.c sv3tty_tos.h ../sv3tty_proto.h
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ sv3tstat.c cookie.c
@@ -26,11 +31,11 @@ sv3taux.ttp: sv3taux.c cookie.c sv3tty_tos.h ../sv3tty_proto.h
 
 # Check that the code called from the interrupt uses no FPU instructions
 fpucheck:
-	$(CC) $(CFLAGS) -o sv3tty.sym sv3tty_tos.c timerc.S bios.S cookie.c ../sv3tty_proto.c
+	$(CC) $(CFLAGS) -o sv3tty.sym sv3tty_tos.c timerc.S bios.S ddev.S cookie.c ../sv3tty_proto.c
 	$(OBJDUMP) -d sv3tty.sym | grep -c -E '\sf(move|add|sub|mul|div|cmp|tst|save|restore)' || true
 	rm -f sv3tty.sym
 
 clean:
-	rm -f sv3tty.prg sv3tstat.tos sv3tclos.ttp sv3taux.ttp sv3tty.sym
+	rm -f sv3tty.prg sv3ttydb.prg sv3tstat.tos sv3tclos.ttp sv3taux.ttp sv3tty.sym
 
 .PHONY: all clean fpucheck

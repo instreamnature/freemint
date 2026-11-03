@@ -359,7 +359,12 @@ Which program runs on each port is decided in `/etc/inittab` (or
 systemd units) on PetaLinux. Proposal:
 
 - `ttySV0`: `getty` with a normal login, like the Z-turn USB console.
-  `TERM=vt52`.
+  `TERM=st52`, for TOS programs that draw with the VT52 emulation of TOS
+  (CoNnect, `sv3ttest`).
+- `ttySV1`: `getty` with a normal login, `TERM=vt100`, for FreeMiNT
+  console windows (Conholio, Toswin2), which emulate VT100/ANSI and not
+  VT52 (`ESC D` is Index there, not cursor left). `sv3term` uses this port
+  by default.
 - One or more ports with autologin as an unprivileged user (no root),
   for simple Falcon programs that read files like
   `/sys/class/thermal/thermal_zone0/temp` or run `uptime`.

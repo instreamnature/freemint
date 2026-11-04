@@ -114,6 +114,9 @@ utan att allt behöver förklaras igen. Svara på svenska.
   men när IACK-cykeln körs har FPGA:n släppt IRQ6. Ingen svarar med TA,
   CT60:ns timeout drar TEA och det blir bussfel. Passar PC, `AA=0`,
   `RW=??` och slumpmässigheten.
+  **Bekräftat i VHDL (2026-10-08):** `zturn_bus_interface.vhd` svarar bara på
+  IACK nivå 6 om `int_interrupt_total_p = '1'` just då (rad ~799), annars
+  ingen TA.
 - **Åtgärd (2026-10-02):** i `sv3eth_output` ersätts IE-växlingen med
   `sr = spl7(); send_packet(...); spl(sr);` (kräver `#include "mint/asm.h"`),
   samma mönster som `lance.c`. Byggd, 5 926 byte. Föregående version sparas
@@ -171,7 +174,11 @@ utan att allt behöver förklaras igen. Svara på svenska.
 - Andra fynd: `dev_info()` per paket (irq/xmit/poll), en stor
   prestandabroms. `pos` och `len` från mailboxen kontrolleras inte
   (out-of-bounds på `tx_psdma_buf_flags[]` och DMA-området).
-- **Gjort (2026-10-05), ej committat i Ubuntu-repot:** `sv3mboxdriver.c` har
+- **Committat 2026-10-06 som `9acde04` i Ubuntu-repot (`master`) och
+  pushat.** Remote är nu ssh (`git@github.com:instreamnature/SV3_petalinux.git`)
+  med en egen nyckel på Ubuntu (`~/.ssh/id_ed25519`). Den tidigare
+  https-adressen med token i klartext är borta, och token återkallas på GitHub.
+- **Gjort (2026-10-05):** `sv3mboxdriver.c` har
   handslaget (`SV3_RESYNC_WORD` i `poll()`), kontroll av `pos`/`len`,
   `rx_dropped++`, `eth_hw_addr_set()` i `set_mac_address`, och `dev_info`
   per paket bortkommenterade (`queue full` via `net_ratelimit()`). Byggd med
@@ -370,3 +377,36 @@ dequeue-koden i filen är från SV2 och fungerar inte med mailboxen.
   `if_dequeue()`, `if_input()`, `eth_remove_hdr()`, `addroottimeout(..., 1)`.
 - Inga BIOS/GEMDOS-anrop i ISR-kedjan eller i root-timeouts.
 - Ändra en sak i taget mellan testkörningar.
+
+## sv3tty – seriekanaler mellan 060 och Linux (klart 2026-11)
+
+- Virtuella serieportar `ttySV0..15` över mailbox-kanal 1 (`0x80013040`,
+  ingen interrupt på 060-sidan, pollas). Rör aldrig IE-bitar eller mbox0
+  (sv3eth). Protokollet: `sys/xdd/sv3tty/PROTOCOL.md`. Delad
+  protokollkod: `sv3tty_proto.c/.h`. Teckenkonvertering Atari ↔ UTF-8:
+  `charset.c/.h`.
+- 060-sidan i `sys/xdd/sv3tty/`:
+  - `tos/`: TSR `sv3tty.prg` (Timer C-hook, BIOS-enheter via Bconmap,
+    HSMODEM/DRVIN-stöd) och spårningsversionen `sv3ttydb.prg`.
+  - `mint/`: `sv3tty.xdd`, enheter `u:\dev\ttySV0..15`, root-timeout var
+    5 ms. `make` ger `.compile_060/sv3tty.xdd`.
+  - `sv3term/`: terminalprogram för MiNT-fönster (rått läge, fönsterstorlek
+    via `TIOCSWINSZ`/`SIGWINCH`, UTF-8-konvertering, Ctrl-T avslutar,
+    standardport `ttySV1`).
+  - `test/`: `sv3ttest.tos`, terminal under ren TOS (översätter ANSI-färger
+    till TOS VT52-färger).
+- Linux-sidan: `sv3tty.ko`, recept `recipes-modules/sv3tty` i
+  PetaLinux-repot. Getty: `ttySV0` med `TERM=st52` (TOS, CoNnect,
+  sv3ttest), `ttySV1` med `TERM=vt100` (Conholio, Toswin2).
+  `/etc/profile.d/sv3tty.sh` sätter UTF-8-`LANG` och färgprompt (ej st52).
+- **Conholio och Toswin2 emulerar VT100/ANSI, inte VT52** (`ESC D` = Index,
+  `ESC A/C/Y/K` ignoreras). Färger och invers fungerar, fetstil inte.
+- **sysvinit läser bara första posten i varje fil i `/etc/inittab.d`**,
+  därför en fil per port (`sv3tty.tab`, `sv3tty1.tab`). `init q` tar in en
+  ny fil, men inte nya rader i en befintlig.
+- En getty startad för hand fungerar inte: OPEN från 060 ger hangup, och
+  init måste starta en ny getty för att prompten ska komma.
+- Öppet: HDDRIVER fastnar ibland på IDE BSY (DOM-disken, E:) när CoNnect
+  avslutas med TOS-drivrutinen aktiv. Orsak okänd.
+- Kosmetiskt: långa kommandon i bash-historiken kan skriva över prompten i
+  Conholio (troligen radbrytning i sista kolumnen). Användaren lever med det.
